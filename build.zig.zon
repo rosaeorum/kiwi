@@ -30,5 +30,9 @@
             .url = "https://github.com/allyourcodebase/x11-headers/archive/947022308236478b13fd39b638bf8a2264725751.zip",
             .hash = "N-V-__8AAJaARwDVWtryGrmN1iiu2qeZKabbbr9H1GCKrTiN",
         },
+        .vulkan = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig.git#f9688c6f4ebcb930f67044698ddd1322442e714b",
+            .hash = "vulkan-0.0.0-r7Ytx4yGAwDZf0XsT6_L1ol_XUAkyOgOyBqamf8begA0",
+        },
     },
 }

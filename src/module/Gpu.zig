@@ -48,7 +48,7 @@ pub fn init(device: *Device) !*Gpu {
 
     self.descriptor_pool = try self.device.proxy.createDescriptorPool(
         &vk.DescriptorPoolCreateInfo{
-            .flags = .{ .update_after_bind_bit = true },
+            .flags = .{ .update_after_bind = true },
             .max_sets = 1,
             .pool_size_count = 2,
             .p_pool_sizes = &[_]vk.DescriptorPoolSize{
@@ -68,21 +68,21 @@ pub fn init(device: *Device) !*Gpu {
 
     self.descriptor_layout = try self.device.proxy.createDescriptorSetLayout(
         &vk.DescriptorSetLayoutCreateInfo{
-            .flags = .{ .update_after_bind_pool_bit = true },
+            .flags = .{ .update_after_bind_pool = true },
             .binding_count = 2,
             .p_bindings = &[_]vk.DescriptorSetLayoutBinding{
                 .{
                     .binding = 0,
                     .descriptor_type = .sampled_image,
                     .descriptor_count = self.max_images,
-                    .stage_flags = .{ .fragment_bit = true },
+                    .stage_flags = .{ .fragment = true },
                     .p_immutable_samplers = null,
                 },
                 .{
                     .binding = 1,
                     .descriptor_type = .sampler,
                     .descriptor_count = self.max_samplers,
-                    .stage_flags = .{ .fragment_bit = true },
+                    .stage_flags = .{ .fragment = true },
                     .p_immutable_samplers = null,
                 },
             },
@@ -90,12 +90,12 @@ pub fn init(device: *Device) !*Gpu {
                 .binding_count = 2,
                 .p_binding_flags = &[_]vk.DescriptorBindingFlags{
                     .{
-                        .partially_bound_bit = true,
-                        .update_after_bind_bit = true,
+                        .partially_bound = true,
+                        .update_after_bind = true,
                     },
                     .{
-                        .partially_bound_bit = true,
-                        .update_after_bind_bit = true,
+                        .partially_bound = true,
+                        .update_after_bind = true,
                     },
                 },
             },
@@ -118,7 +118,7 @@ pub fn init(device: *Device) !*Gpu {
 
     self.command_pool = try self.device.proxy.createCommandPool(
         &.{
-            .flags = .{ .reset_command_buffer_bit = true },
+            .flags = .{ .reset_command_buffer = true },
             .queue_family_index = self.device.graphics_queue.family,
         },
         null,
@@ -293,6 +293,59 @@ pub const Instance = struct {
     proxy: vk.InstanceProxy,
     debug_messenger: vk.DebugUtilsMessengerEXT = .null_handle,
 
+    const std = @import("std");
+    pub const GetInstanceProcAddr: vk.PfnGetInstanceProcAddr = if (base.build_info.target.os.tag == .windows) windows_proc_wrapper: {
+        const vk_proc = struct {
+            pub var dll: ?std.os.windows.HMODULE = null;
+            pub var loader: vk.PfnGetInstanceProcAddr = undefined;
+        };
+
+        break :windows_proc_wrapper &struct {
+            pub fn getProcAddress(instance: ?vk.Instance, name: [*:0]const u8) callconv(vk.vulkan_call_conv) vk.PfnVoidFunction {
+                const loader = if (vk_proc.dll != null) vk_proc.loader else init_dll: {
+                    @branchHint(.unlikely);
+
+                    vk_proc.dll = base.kernel32.LoadLibraryW(base.unicode.utf8ToUtf16LeStringLiteral("vulkan-1.dll")) orelse @panic("failed to load vulkan-1.dll");
+
+                    vk_proc.loader = @ptrCast(base.kernel32.GetProcAddress(vk_proc.dll.?, "vkGetInstanceProcAddr") orelse @panic("failed to load vulkan-1.dll symbol"));
+
+                    break :init_dll vk_proc.loader;
+                };
+
+                return loader(instance, name);
+            }
+        }.getProcAddress;
+    } else posix_proc_wrapper: {
+        const so_names = [_][:0]const u8{
+            "libvulkan.so.1",
+            "libvulkan.so",
+        };
+
+        const vk_proc = struct {
+            pub var so: ?std.DynLib = null;
+            pub var loader: vk.PfnGetInstanceProcAddr = undefined;
+        };
+
+        break :posix_proc_wrapper &struct {
+            pub fn getProcAddress(instance: ?vk.Instance, name: [*:0]const u8) callconv(vk.vulkan_call_conv) vk.PfnVoidFunction {
+                const loader = if (vk_proc.so != null) vk_proc.loader else init_so: {
+                    @branchHint(.unlikely);
+
+                    vk_proc.so = for (so_names) |so_name| {
+                        const lib = std.DynLib.openZ(so_name) catch continue;
+                        break lib;
+                    } else @panic("failed to load libvulkan");
+
+                    vk_proc.loader = vk_proc.so.?.lookup(vk.PfnGetInstanceProcAddr, "vkGetInstanceProcAddr") orelse @panic("failed to load libvulkan symbol");
+
+                    break :init_so vk_proc.loader;
+                };
+
+                return loader(instance, name);
+            }
+        }.getProcAddress;
+    };
+
     pub fn init(
         enable_validation: bool,
         application_name: [*:0]const u8,
@@ -303,7 +356,7 @@ pub const Instance = struct {
         errdefer base.gpa.destroy(self);
 
         self.* = Instance{
-            .base_wrapper = vk.BaseWrapper.load(vk.GetInstanceProcAddr),
+            .base_wrapper = vk.BaseWrapper.load(GetInstanceProcAddr),
             .wrapper = undefined,
             .proxy = undefined,
         };
@@ -364,13 +417,13 @@ pub const Instance = struct {
         if (enable_validation) {
             self.debug_messenger = self.proxy.createDebugUtilsMessengerEXT(&.{
                 .message_severity = .{
-                    .error_bit_ext = true,
-                    .warning_bit_ext = true,
+                    .error_ext = true,
+                    .warning_ext = true,
                 },
                 .message_type = .{
-                    .general_bit_ext = true,
-                    .validation_bit_ext = true,
-                    .performance_bit_ext = true,
+                    .general_ext = true,
+                    .validation_ext = true,
+                    .performance_ext = true,
                 },
                 .pfn_user_callback = &struct {
                     pub fn vulkan_debug_callback(
@@ -383,11 +436,11 @@ pub const Instance = struct {
                         _ = p_user_data;
                         b: {
                             const msg = (p_callback_data orelse break :b).p_message orelse break :b;
-                            if (message_severity.error_bit_ext)
+                            if (message_severity.error_ext)
                                 log.err("{s}", .{msg})
-                            else if (message_severity.warning_bit_ext)
+                            else if (message_severity.warning_ext)
                                 log.warn("{s}", .{msg})
-                            else if (message_severity.info_bit_ext)
+                            else if (message_severity.info_ext)
                                 log.info("{s}", .{msg})
                             else
                                 log.debug("{s}", .{msg});
@@ -512,7 +565,7 @@ pub const Instance = struct {
         for (families, 0..) |properties, i| {
             const family: u32 = @intCast(i);
 
-            if (graphics_family == null and properties.queue_flags.graphics_bit) {
+            if (graphics_family == null and properties.queue_flags.graphics) {
                 graphics_family = family;
             }
 
@@ -802,8 +855,8 @@ pub const Buffer = packed struct(u64) {
         return initAdvanced(
             gpu,
             size,
-            .{ .transfer_dst_bit = true, .shader_device_address_bit = true },
-            .{ .device_local_bit = true },
+            .{ .transfer_dst = true, .shader_device_address = true },
+            .{ .device_local = true },
         );
     }
 
@@ -892,7 +945,7 @@ pub const Buffer = packed struct(u64) {
             debug.assert(state.* == null);
 
             var alloc_flags = vma.AllocationCreateFlags{};
-            if (flags.host_visible_bit) {
+            if (flags.host_visible) {
                 alloc_flags.mapped_bit = true;
                 alloc_flags.host_access_sequential_write_bit = true;
             }
@@ -974,11 +1027,11 @@ pub const Image = packed struct(u64) {
             height,
             .r8g8b8a8_unorm,
             .{
-                .transfer_dst_bit = true,
-                .sampled_bit = true,
-                .color_attachment_bit = true,
+                .transfer_dst = true,
+                .sampled = true,
+                .color_attachment = true,
             },
-            .{ .device_local_bit = true },
+            .{ .device_local = true },
         );
     }
 
@@ -1092,7 +1145,7 @@ pub const Image = packed struct(u64) {
                 .extent = .{ .width = width, .height = height, .depth = 1 },
                 .mip_levels = 1,
                 .array_layers = 1,
-                .samples = .{ .@"1_bit" = true },
+                .samples = .{ .@"1" = true },
                 .tiling = .optimal,
                 .usage = usage,
                 .sharing_mode = .exclusive,
@@ -1116,7 +1169,7 @@ pub const Image = packed struct(u64) {
                     .a = .identity,
                 },
                 .subresource_range = .{
-                    .aspect_mask = .{ .color_bit = true },
+                    .aspect_mask = .{ .color = true },
                     .base_mip_level = 0,
                     .level_count = 1,
                     .base_array_layer = 0,
@@ -1447,8 +1500,8 @@ pub fn RingBuffer(comptime T: type) type {
             const managed_buffer = try Buffer.initAdvanced(
                 gpu,
                 @intCast(total_size),
-                .{ .shader_device_address_bit = true }, // We need the GPU address!
-                .{ .host_visible_bit = true, .host_coherent_bit = true },
+                .{ .shader_device_address = true }, // We need the GPU address!
+                .{ .host_visible = true, .host_coherent = true },
             );
             errdefer managed_buffer.deinit(gpu);
 
@@ -1492,8 +1545,8 @@ pub const StagingBuffer = struct {
         self.managed_buffer = try Buffer.initAdvanced(
             gpu,
             capacity,
-            .{ .transfer_src_bit = true },
-            .{ .host_visible_bit = true, .host_coherent_bit = true },
+            .{ .transfer_src = true },
+            .{ .host_visible = true, .host_coherent = true },
         );
         errdefer self.managed_buffer.deinit(gpu);
 
@@ -1567,7 +1620,7 @@ pub const SwapChain = struct {
             errdefer self.gpu.device.proxy.destroySemaphore(self.avail_semaphores[slot_index], null);
 
             self.fences[slot_index] = try self.gpu.device.proxy.createFence(
-                &.{ .flags = .{ .signaled_bit = true } },
+                &.{ .flags = .{ .signaled = true } },
                 null,
             );
             errdefer self.gpu.device.proxy.destroyFence(self.fences[slot_index], null);
@@ -1613,12 +1666,12 @@ pub const SwapChain = struct {
             .image_color_space = surface_format.color_space,
             .image_extent = .{ .width = self.extent[0], .height = self.extent[1] },
             .image_array_layers = 1,
-            .image_usage = .{ .color_attachment_bit = true, .transfer_dst_bit = true },
+            .image_usage = .{ .color_attachment = true, .transfer_dst = true },
             .image_sharing_mode = sharing_mode,
             .queue_family_index_count = qfi.len,
             .p_queue_family_indices = &qfi,
             .pre_transform = caps.current_transform,
-            .composite_alpha = .{ .opaque_bit_khr = true },
+            .composite_alpha = .{ .opaque_khr = true },
             .present_mode = present_mode,
             .clipped = .true,
             .old_swapchain = self.handle,
@@ -1662,7 +1715,7 @@ pub const SwapChain = struct {
                         .a = .identity,
                     },
                     .subresource_range = .{
-                        .aspect_mask = .{ .color_bit = true },
+                        .aspect_mask = .{ .color = true },
                         .base_mip_level = 0,
                         .level_count = 1,
                         .base_array_layer = 0,
@@ -1763,10 +1816,10 @@ pub const SwapChain = struct {
 
                 .undefined,
                 .color_attachment_optimal,
-                .{ .color_attachment_output_bit = true },
+                .{ .color_attachment_output = true },
                 .{},
-                .{ .color_attachment_output_bit = true },
-                .{ .color_attachment_write_bit = true },
+                .{ .color_attachment_output = true },
+                .{ .color_attachment_write = true },
             );
             return swap_view;
         }
@@ -1783,9 +1836,9 @@ pub const SwapChain = struct {
             swap_image,
             .color_attachment_optimal,
             .present_src_khr,
-            .{ .color_attachment_output_bit = true },
-            .{ .color_attachment_write_bit = true },
-            .{ .bottom_of_pipe_bit = true },
+            .{ .color_attachment_output = true },
+            .{ .color_attachment_write = true },
+            .{ .bottom_of_pipe = true },
             .{},
         );
 
@@ -2014,7 +2067,7 @@ pub const Pipeline = struct {
 
                         .polygon_mode = .fill,
 
-                        .cull_mode = .{ .back_bit = true },
+                        .cull_mode = .{ .back = true },
                         .front_face = .counter_clockwise,
 
                         .depth_bias_enable = .false,
@@ -2048,10 +2101,10 @@ pub const Pipeline = struct {
                                 .dst_alpha_blend_factor = .one_minus_src_alpha,
                                 .alpha_blend_op = .add,
                                 .color_write_mask = .{
-                                    .r_bit = true,
-                                    .g_bit = true,
-                                    .b_bit = true,
-                                    .a_bit = true,
+                                    .r = true,
+                                    .g = true,
+                                    .b = true,
+                                    .a = true,
                                 },
                             },
                         },
@@ -2060,12 +2113,12 @@ pub const Pipeline = struct {
                     .stage_count = 2,
                     .p_stages = &[_]vk.PipelineShaderStageCreateInfo{
                         .{
-                            .stage = .{ .vertex_bit = true },
+                            .stage = .{ .vertex = true },
                             .module = vertex_mod.handle,
                             .p_name = "main",
                         },
                         .{
-                            .stage = .{ .fragment_bit = true },
+                            .stage = .{ .fragment = true },
                             .module = fragment_mod.handle,
                             .p_name = "main",
                         },
@@ -2206,7 +2259,7 @@ pub const CommandBuffer = struct {
         errdefer self.image_barriers.deinit(base.gpa);
 
         self.in_flight_fence = try self.gpu.device.proxy.createFence(
-            &.{ .flags = .{ .signaled_bit = true } },
+            &.{ .flags = .{ .signaled = true } },
             null,
         );
 
@@ -2253,7 +2306,7 @@ pub const CommandBuffer = struct {
             log.err("Failed to submit commandbuffer: {s}", .{@errorName(err)});
             return;
         };
-        for (wait_stages) |*stage| stage.* = .{ .color_attachment_output_bit = true };
+        for (wait_stages) |*stage| stage.* = .{ .color_attachment_output = true };
 
         self.gpu.device.proxy.queueSubmit(
             self.gpu.device.graphics_queue.handle,
@@ -2308,7 +2361,7 @@ pub const CommandBuffer = struct {
             .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
             .image = image,
             .subresource_range = .{
-                .aspect_mask = .{ .color_bit = true }, // TODO: Extend for depth buffers
+                .aspect_mask = .{ .color = true }, // TODO: Extend for depth buffers
                 .base_mip_level = 0,
                 .level_count = 1,
                 .base_array_layer = 0,
@@ -2470,14 +2523,14 @@ pub const CommandBuffer = struct {
         defer self.flushed = true;
 
         const memory_barrier = vk.MemoryBarrier{
-            .src_access_mask = .{ .transfer_write_bit = true },
-            .dst_access_mask = .{ .shader_read_bit = true }, // Or vertex_attribute_read_bit if using standard VBOs
+            .src_access_mask = .{ .transfer_write = true },
+            .dst_access_mask = .{ .shader_read = true }, // Or vertex_attribute_read if using standard VBOs
         };
 
         self.gpu.device.proxy.cmdPipelineBarrier(
             self.handle,
-            .{ .transfer_bit = true },
-            .{ .vertex_shader_bit = true, .fragment_shader_bit = true },
+            .{ .transfer = true },
+            .{ .vertex_shader = true, .fragment_shader = true },
             .{},
             &[_]vk.MemoryBarrier{memory_barrier}, // <-- Added global memory barrier here!
             null,
@@ -2519,21 +2572,21 @@ pub const CommandBuffer = struct {
             // Pre-copy barrier (Executed immediately)
             self.gpu.device.proxy.cmdPipelineBarrier(
                 self.handle,
-                .{ .top_of_pipe_bit = true },
-                .{ .transfer_bit = true },
+                .{ .top_of_pipe = true },
+                .{ .transfer = true },
                 .{},
                 null,
                 null,
                 &[_]vk.ImageMemoryBarrier{.{
                     .src_access_mask = .{},
-                    .dst_access_mask = .{ .transfer_write_bit = true },
+                    .dst_access_mask = .{ .transfer_write = true },
                     .old_layout = self.gpu.store.image.storage.fieldPtr(.state, image.storage_index).*.?.layout,
                     .new_layout = .transfer_dst_optimal,
                     .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                     .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                     .image = image.getHandle(self.gpu),
                     .subresource_range = .{
-                        .aspect_mask = .{ .color_bit = true },
+                        .aspect_mask = .{ .color = true },
                         .base_mip_level = 0,
                         .level_count = 1,
                         .base_array_layer = 0,
@@ -2544,15 +2597,15 @@ pub const CommandBuffer = struct {
 
             // Post-copy barrier (Queued for later)
             gop.value_ptr.* = vk.ImageMemoryBarrier{
-                .src_access_mask = .{ .transfer_write_bit = true },
-                .dst_access_mask = .{ .shader_read_bit = true },
+                .src_access_mask = .{ .transfer_write = true },
+                .dst_access_mask = .{ .shader_read = true },
                 .old_layout = .transfer_dst_optimal,
                 .new_layout = .shader_read_only_optimal,
                 .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                 .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                 .image = image.getHandle(self.gpu),
                 .subresource_range = .{
-                    .aspect_mask = .{ .color_bit = true },
+                    .aspect_mask = .{ .color = true },
                     .base_mip_level = 0,
                     .level_count = 1,
                     .base_array_layer = 0,
@@ -2574,7 +2627,7 @@ pub const CommandBuffer = struct {
                 .buffer_row_length = 0,
                 .buffer_image_height = 0,
                 .image_subresource = .{
-                    .aspect_mask = .{ .color_bit = true },
+                    .aspect_mask = .{ .color = true },
                     .mip_level = 0,
                     .base_array_layer = 0,
                     .layer_count = 1,
@@ -2617,21 +2670,21 @@ pub const CommandBuffer = struct {
             // Pre-copy barrier (Executed immediately)
             self.gpu.device.proxy.cmdPipelineBarrier(
                 self.handle,
-                .{ .top_of_pipe_bit = true },
-                .{ .transfer_bit = true },
+                .{ .top_of_pipe = true },
+                .{ .transfer = true },
                 .{},
                 null,
                 null,
                 &[_]vk.ImageMemoryBarrier{.{
                     .src_access_mask = .{},
-                    .dst_access_mask = .{ .transfer_write_bit = true },
+                    .dst_access_mask = .{ .transfer_write = true },
                     .old_layout = self.gpu.store.image.storage.fieldPtr(.state, image.storage_index).?.layout,
                     .new_layout = .transfer_dst_optimal,
                     .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                     .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                     .image = self.gpu.store.image.storage.fieldPtr(.state, image.storage_index).?.handle,
                     .subresource_range = .{
-                        .aspect_mask = .{ .color_bit = true },
+                        .aspect_mask = .{ .color = true },
                         .base_mip_level = 0,
                         .level_count = 1,
                         .base_array_layer = 0,
@@ -2642,15 +2695,15 @@ pub const CommandBuffer = struct {
 
             // Post-copy barrier (Queued for later)
             self.gpu.store.image.storage.fieldMut(.barrier, image.storage_index).* = vk.ImageMemoryBarrier{
-                .src_access_mask = .{ .transfer_write_bit = true },
-                .dst_access_mask = .{ .shader_read_bit = true },
+                .src_access_mask = .{ .transfer_write = true },
+                .dst_access_mask = .{ .shader_read = true },
                 .old_layout = .transfer_dst_optimal,
                 .new_layout = .shader_read_only_optimal,
                 .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                 .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
                 .image = self.gpu.store.image.storage.fieldPtr(.state, image.storage_index).?.handle,
                 .subresource_range = .{
-                    .aspect_mask = .{ .color_bit = true },
+                    .aspect_mask = .{ .color = true },
                     .base_mip_level = 0,
                     .level_count = 1,
                     .base_array_layer = 0,
@@ -2671,7 +2724,7 @@ pub const CommandBuffer = struct {
                 .buffer_row_length = 0,
                 .buffer_image_height = 0,
                 .image_subresource = .{
-                    .aspect_mask = .{ .color_bit = true },
+                    .aspect_mask = .{ .color = true },
                     .mip_level = 0,
                     .base_array_layer = 0,
                     .layer_count = 1,
@@ -2776,20 +2829,20 @@ pub const SampleCount = enum(u32) {
 
     pub fn toVk(self: SampleCount) vk.SampleCountFlags {
         return switch (self) {
-            .@"1" => vk.SampleCountFlags{ .@"1_bit" = true },
-            .@"2" => vk.SampleCountFlags{ .@"2_bit" = true },
-            .@"4" => vk.SampleCountFlags{ .@"4_bit" = true },
-            .@"8" => vk.SampleCountFlags{ .@"8_bit" = true },
-            .@"16" => vk.SampleCountFlags{ .@"16_bit" = true },
+            .@"1" => vk.SampleCountFlags{ .@"1" = true },
+            .@"2" => vk.SampleCountFlags{ .@"2" = true },
+            .@"4" => vk.SampleCountFlags{ .@"4" = true },
+            .@"8" => vk.SampleCountFlags{ .@"8" = true },
+            .@"16" => vk.SampleCountFlags{ .@"16" = true },
         };
     }
 
     pub fn fromVk(flags: vk.SampleCountFlags) SampleCount {
-        if (flags.@"16_bit") return .@"16";
-        if (flags.@"8_bit") return .@"8";
-        if (flags.@"4_bit") return .@"4";
-        if (flags.@"2_bit") return .@"2";
-        if (flags.@"1_bit") return .@"1";
+        if (flags.@"16") return .@"16";
+        if (flags.@"8") return .@"8";
+        if (flags.@"4") return .@"4";
+        if (flags.@"2") return .@"2";
+        if (flags.@"1") return .@"1";
         debug.panic("Unsupported vk.SampleCountFlags; expected 1, 2, 4, 8 or 16, got: {any}", .{flags});
     }
 

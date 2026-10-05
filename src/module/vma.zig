@@ -141,22 +141,22 @@ pub const VulkanFunctions = extern struct {
 
 pub const AllocatorCreateInfo = extern struct {
     flags: AllocatorCreateFlags = .{},
-    physicalDevice: vk.PhysicalDevice = .null_handle,
-    device: vk.Device = .null_handle,
+    physicalDevice: ?vk.PhysicalDevice = null,
+    device: ?vk.Device = null,
     preferredLargeHeapBlockSize: vk.DeviceSize = 0,
     pAllocationCallbacks: ?*const vk.AllocationCallbacks = null,
     pDeviceMemoryCallbacks: ?*const DeviceMemoryCallbacks = null,
     pHeapSizeLimit: ?*const vk.DeviceSize = null,
     pVulkanFunctions: ?*const VulkanFunctions = null,
-    instance: vk.Instance = .null_handle,
+    instance: ?vk.Instance = null,
     vulkanApiVersion: u32 = 0,
     pTypeExternalMemoryHandleTypes: ?*const vk.ExternalMemoryHandleTypeFlagsKHR = null,
 };
 
 pub const AllocatorInfo = extern struct {
-    instance: vk.Instance = .null_handle,
-    physicalDevice: vk.PhysicalDevice = .null_handle,
-    device: vk.Device = .null_handle,
+    instance: ?vk.Instance = null,
+    physicalDevice: ?vk.PhysicalDevice = null,
+    device: ?vk.Device = null,
 };
 
 pub const Statistics = extern struct {

@@ -43,7 +43,7 @@ pub fn main() anyerror!void {
     defer ring_buffer.deinit(client.gpu);
 
     const push_constant_range = Gpu.PushConstantRange{
-        .stage_flags = .{ .vertex_bit = true },
+        .stage_flags = .{ .vertex = true },
         .offset = 0,
         .size = @sizeOf(PushConstants),
     };

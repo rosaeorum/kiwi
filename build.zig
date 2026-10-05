@@ -22,7 +22,25 @@ pub fn build(b: *Build) void {
         );
     };
 
-    const glfw_lib = buildGlfw(b, target, optimize);
+    const vulkan_headers = b.dependency("vulkan_headers", .{});
+    const vulkan_dep = b.dependency("vulkan", .{
+        .target = b.graph.host,
+        .optimize = .safe,
+    });
+
+    const vulkan_bindgen = vulkan_dep.artifact("vulkan-zig-generator");
+    const vulkan_bindgen_run = b.addRunArtifact(vulkan_bindgen);
+
+    vulkan_bindgen_run.addFileArg2(vulkan_headers.path("registry/vk.xml"), .{});
+    const vulkan_bindings = vulkan_bindgen_run.addOutputFileArg2("vulkan.zig", .{});
+
+    const write_vulkan_bindings_source = b.addUpdateSourceFiles();
+    write_vulkan_bindings_source.addCopyFileToSource(vulkan_bindings, "src/module/vulkan.zig");
+
+    const bindgen_step = b.step("gen-vk", "run vulkan-zig-generator to update src/module/vulkan.zig");
+    bindgen_step.dependOn(&write_vulkan_bindings_source.step);
+
+    const glfw_lib = buildGlfw(b, target, optimize, vulkan_headers);
     const vma_lib = buildVma(b, target, optimize);
 
     const kiwi_mod = b.addModule("kiwi", .{
@@ -279,7 +297,7 @@ fn buildVma(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode) *Bu
     return lib;
 }
 
-fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode) *Build.Step.Compile {
+fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vulkan_headers: *Build.Dependency) *Build.Step.Compile {
     const base_sources = [_][]const u8{
         "context.c",
         "egl_context.c",
@@ -330,7 +348,6 @@ fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode) *B
     };
 
     const glfw_dep = b.dependency("glfw", .{});
-    const vulkan_headers = b.dependency("vulkan_headers", .{});
     const x11_headers = b.dependency("x11_headers", .{});
     const wayland_headers = b.dependency("wayland_headers", .{});
 
