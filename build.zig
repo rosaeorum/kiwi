@@ -49,8 +49,8 @@ pub fn build(b: *Build) !void {
     const wasmtime_include = wasmtime_dep.path("include");
     const wasmtime_lib = wasmtime_dep.path("lib/libwasmtime.a");
 
-    const translate_c = b.dependency("translate_c", .{}); //
-    const t = Translator.init(translate_c, .{ //
+    const translate_c_dep = b.dependency("translate_c", .{});
+    const t = Translator.init(translate_c_dep, .{
         .c_source_file = b.addWriteFiles().add(
             "wasm.c",
             \\#include "wasm.h"
@@ -72,16 +72,8 @@ pub fn build(b: *Build) !void {
     const wasm_bindgen_step = b.step("gen-wasm", "run translate-c to update src/module/wasmtime.zig");
     wasm_bindgen_step.dependOn(&write_wasm_bindings_source.step);
 
-    const glfw_lib = buildGlfw(b, target, optimize, vulkan_headers);
+    const glfw_lib = buildGlfw(b, target, optimize, vulkan_headers, translate_c_dep);
     const vma_lib = buildVma(b, target, optimize);
-
-    const kiwi_mod = b.addModule("kiwi", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/module/kiwi.zig"),
-        .link_libc = true,
-        .link_libcpp = true,
-    });
 
     const static_config = b.addOptions();
 
@@ -110,11 +102,20 @@ pub fn build(b: *Build) !void {
         );
     }
 
-    kiwi_mod.addOptions("static_config", static_config);
+    const kiwi_mod = b.addModule("kiwi", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/module/kiwi.zig"),
+        .link_libc = true,
+        .link_libcpp = true,
+    });
 
+    kiwi_mod.addOptions("static_config", static_config);
     kiwi_mod.linkLibrary(glfw_lib);
     kiwi_mod.linkLibrary(vma_lib);
     kiwi_mod.addObjectFile(wasmtime_lib);
+    kiwi_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
+    kiwi_mod.addImport("helpers", translate_c_dep.module("helpers"));
 
     const kiwi_test = b.addTest(.{ .root_module = kiwi_mod });
 
@@ -137,6 +138,8 @@ pub fn build(b: *Build) !void {
     driver_mod.linkLibrary(glfw_lib);
     driver_mod.linkLibrary(vma_lib);
     driver_mod.addObjectFile(wasmtime_lib);
+    driver_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
+    driver_mod.addImport("helpers", translate_c_dep.module("helpers"));
 
     appendStatic(driver_mod);
 
@@ -333,7 +336,7 @@ fn buildVma(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode) *Bu
     return lib;
 }
 
-fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vulkan_headers: *Build.Dependency) *Build.Step.Compile {
+fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vulkan_headers: *Build.Dependency, translate_c_dep: *Build.Dependency) *Build.Step.Compile {
     const base_sources = [_][]const u8{
         "context.c",
         "egl_context.c",
@@ -388,6 +391,32 @@ fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vu
     const wayland_headers = b.dependency("wayland_headers", .{});
 
     const glfw_src = glfw_dep.path("src");
+    const glfw_include = glfw_dep.path("include");
+
+    const t = Translator.init(translate_c_dep, .{
+        .c_source_file = b.addWriteFiles().add(
+            "glfw.c",
+            \\#include "GLFW/glfw3.h"
+            // \\#include "GLFW/glfw3native.h"
+            ,
+        ),
+        .target = target,
+        .optimize = optimize,
+    });
+    t.defineCMacro("GLFW_INCLUDE_NONE", "");
+    // t.defineCMacro("GLFW_INCLUDE_VULKAN", "");
+    t.addIncludePath(glfw_include);
+    // t.addIncludePath(x11_headers.path("include"));
+    // t.addIncludePath(wayland_headers.path("include"));
+    // t.addIncludePath(vulkan_headers.path("include"));
+
+    const glfw_bindings = t.output_file;
+
+    const write_glfw_bindings_source = b.addUpdateSourceFiles();
+    write_glfw_bindings_source.addCopyFileToSource(glfw_bindings, "src/module/glfw.zig");
+
+    const glfw_bindgen_step = b.step("gen-glfw", "run translate-c to update src/module/glfw.zig");
+    glfw_bindgen_step.dependOn(&write_glfw_bindings_source.step);
 
     const lib = b.addLibrary(.{
         .name = "glfw",

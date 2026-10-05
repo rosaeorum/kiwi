@@ -22,14 +22,17 @@ pub fn init(config: *const Config) !*Client {
     var exts: base.ArrayList(Gpu.Extension) = try .initCapacity(base.temp, Gpu.vk_extension_names.len);
 
     if (config.render_doc_compat and base.build_info.os.tag == .linux) {
-        glfw.initHint(.{ .platform = .x11 });
+        c.glfwInitHint(c.GLFW_PLATFORM, c.GLFW_PLATFORM_X11);
     }
 
-    try glfw.init();
+    if (c.glfwInit() != c.GLFW_TRUE) {
+        @branchHint(.cold);
+        return error.FailedToInitializeGLFW;
+    }
 
     var glfw_ext_count: u32 = 0;
 
-    const glfw_exts = glfw.getRequiredInstanceExtensions(&glfw_ext_count);
+    const glfw_exts = c.glfwGetRequiredInstanceExtensions(&glfw_ext_count);
 
     for (0..glfw_ext_count) |i| {
         const ext_name = mem.span(glfw_exts[i]);
@@ -39,7 +42,7 @@ pub fn init(config: *const Config) !*Client {
             log.err("Could not resolve GLFW requested extension: {s}", .{@errorName(err)});
         }
     }
-    errdefer glfw.deinit();
+    errdefer c.glfwTerminate();
 
     const self = try base.gpa.create(Client);
     errdefer base.gpa.destroy(self);
@@ -79,17 +82,17 @@ pub fn deinit(self: *Client) void {
     device.deinit();
     instance.deinit();
 
-    glfw.deinit();
+    c.glfwTerminate();
 }
 
 pub fn pollEvents(_: *Client) void {
     base.temp_arena.reset();
-    glfw.pollEvents();
+    c.glfwPollEvents();
 }
 
 pub const Window = @import("Window.zig");
 
-const glfw = @import("glfw.zig");
+const c = @import("glfw.zig");
 const linalg = @import("linalg.zig");
 const base = @import("base.zig");
 const mem = base.mem;

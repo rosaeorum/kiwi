@@ -3,7 +3,7 @@
 const Window = @This();
 
 gpu: *Gpu,
-handle: *glfw.Window,
+handle: *c.struct_GLFWwindow,
 surface: Gpu.Surface,
 swap_chain: Gpu.SwapChain,
 
@@ -113,10 +113,37 @@ pub const Config = extern struct {
         x11_instance_name: ?[*:0]const u8 = null,
         wayland_app_id: ?[*:0]const u8 = null,
     } = .{},
+
+    pub const flag_enums = struct {
+        pub const focused = c.GLFW_FOCUSED;
+        pub const iconified = c.GLFW_ICONIFIED;
+        pub const visible = c.GLFW_VISIBLE;
+        pub const maximized = c.GLFW_MAXIMIZED;
+        pub const decorated = c.GLFW_DECORATED;
+        pub const floating = c.GLFW_FLOATING;
+        pub const resizable = c.GLFW_RESIZABLE;
+        pub const auto_iconify = c.GLFW_AUTO_ICONIFY;
+        pub const focus_on_show = c.GLFW_FOCUS_ON_SHOW;
+        pub const center_cursor = c.GLFW_CENTER_CURSOR;
+        pub const scale_to_monitor = c.GLFW_SCALE_TO_MONITOR;
+        pub const scale_framebuffer = c.GLFW_SCALE_FRAMEBUFFER;
+        pub const transparent_framebuffer = c.GLFW_TRANSPARENT_FRAMEBUFFER;
+        pub const mouse_passthrough = c.GLFW_MOUSE_PASSTHROUGH;
+        pub const cocoa_graphics_switching = c.GLFW_COCOA_GRAPHICS_SWITCHING;
+        pub const win32_keyboard_menu = c.GLFW_WIN32_KEYBOARD_MENU;
+        pub const win32_showdefault = c.GLFW_WIN32_SHOWDEFAULT;
+    };
+
+    pub const string_enums = struct {
+        pub const cocoa_frame_name = c.GLFW_COCOA_FRAME_NAME;
+        pub const x11_class_name = c.GLFW_X11_CLASS_NAME;
+        pub const x11_instance_name = c.GLFW_X11_INSTANCE_NAME;
+        pub const wayland_app_id = c.GLFW_WAYLAND_APP_ID;
+    };
 };
 
 pub const Monitor = struct {
-    handle: *glfw.Monitor,
+    handle: *c.struct_GLFWmonitor,
 };
 
 pub fn init(gpu: *Gpu, config: *const Config) !*Window {
@@ -137,40 +164,46 @@ pub fn _beginPreinit(instance: *Gpu.Instance, config: *const Config) !*Window {
     const self = try base.gpa.create(Window);
     errdefer base.gpa.destroy(self);
 
-    glfw.windowHint(.{ .client_api = .none });
+    c.glfwWindowHint(c.GLFW_CLIENT_API, c.GLFW_NO_API);
 
     if (config.position) |pos| {
-        glfw.windowHint(.{ .position_x = pos[0] });
-        glfw.windowHint(.{ .position_y = pos[1] });
+        c.glfwWindowHint(c.GLFW_POSITION_X, pos[0]);
+        c.glfwWindowHint(c.GLFW_POSITION_Y, pos[1]);
     }
 
     inline for (comptime meta.fieldNames(@FieldType(Config, "flags"))) |boolean| {
         if (comptime base.mem.eql(u8, boolean, "_unused_bits")) continue;
 
-        glfw.windowHint(@unionInit(
-            glfw.WindowHint,
-            boolean,
-            @field(config.flags, boolean),
-        ));
+        c.glfwWindowHint(@field(Config.flag_enums, boolean), @intFromBool(@field(config.flags, boolean)));
     }
 
     inline for (comptime meta.fieldNames(@FieldType(Config, "strings"))) |string| {
         if (@field(config.strings, string)) |value| {
-            glfw.windowHint(@unionInit(glfw.WindowHint, string, value));
+            c.glfwWindowHintString(@field(Config.string_enums, string), value);
         }
     }
 
-    self.handle = try glfw.createWindow(
+    self.handle = c.glfwCreateWindow(
         @intCast(config.size[0]),
         @intCast(config.size[1]),
         config.title,
-        if (config.fullscreen_monitor) |m| @ptrCast(m) else null,
+        @ptrCast(config.fullscreen_monitor),
         null,
-    );
-    errdefer glfw.destroyWindow(self.handle);
+    ) orelse {
+        @branchHint(.cold);
+        return error.FailedToCreateWindow;
+    };
+    errdefer c.glfwDestroyWindow(self.handle);
 
-    const surface_result = glfw.createWindowSurface(
-        instance.proxy.handle,
+    const glfwCreateWindowSurface = @extern(*const fn (
+        instance: vk.Instance,
+        window: *c.struct_GLFWwindow,
+        allocator: ?*const vk.AllocationCallbacks,
+        surface: *vk.SurfaceKHR,
+    ) callconv(.c) vk.Result, .{ .name = "glfwCreateWindowSurface" });
+
+    const surface_result = glfwCreateWindowSurface(
+        @ptrCast(instance.proxy.handle),
         self.handle,
         null,
         &self.surface,
@@ -178,7 +211,6 @@ pub fn _beginPreinit(instance: *Gpu.Instance, config: *const Config) !*Window {
 
     if (surface_result != .success) {
         @branchHint(.cold);
-        log.err("Failed to create window surface: {s}", .{@tagName(surface_result)});
         return error.FailedToCreateSurface;
     }
     errdefer instance.proxy.destroySurfaceKHR(self.surface, null);
@@ -193,25 +225,25 @@ pub fn _finalizePreinit(self: *Window, gpu: *Gpu) !void {
 
 pub fn _destroyPreinit(self: *Window, instance: *Gpu.Instance) void {
     instance.proxy.destroySurfaceKHR(self.surface, null);
-    glfw.destroyWindow(self.handle);
+    c.glfwDestroyWindow(self.handle);
     base.gpa.destroy(self);
 }
 
 pub fn show(self: *Window) void {
-    glfw.showWindow(self.handle);
+    c.glfwShowWindow(self.handle);
 }
 
 pub fn hide(self: *Window) void {
-    glfw.hideWindow(self.handle);
+    c.glfwHideWindow(self.handle);
 }
 
 pub fn shouldClose(self: *Window) bool {
-    return glfw.windowShouldClose(self.handle);
+    return c.glfwWindowShouldClose(self.handle) == c.GLFW_TRUE;
 }
 
 pub fn extent(self: *Window) linalg.vec2u {
     var i = [2]i32{ 0, 0 };
-    glfw.getFramebufferSize(self.handle, &i[0], &i[1]);
+    c.glfwGetFramebufferSize(self.handle, &i[0], &i[1]);
     return @intCast(@as(linalg.vec2i, i));
 }
 
@@ -229,7 +261,8 @@ pub fn present(self: *Window) Gpu.SwapChain.PresentState {
     return self.swap_chain.presentImage();
 }
 
-pub const glfw = @import("glfw.zig");
+const c = @import("glfw.zig");
+const vk = @import("vulkan.zig");
 
 const linalg = @import("linalg.zig");
 const frame = @import("frame.zig");
