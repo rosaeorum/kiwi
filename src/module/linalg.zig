@@ -1,0 +1,917 @@
+// public domain
+
+//! A low level, vector-backed library providing linear algebra and trig functions.
+
+const linalg = @This();
+
+const std = @import("std");
+const log = std.log.scoped(.linalg);
+
+test {
+    log.debug("semantic analysis for linalg.zig", .{});
+    std.testing.refAllDecls(@This());
+}
+
+pub const quat = vec4;
+pub const mat4 = [4]vec4;
+pub const mat3 = [3]vec3;
+
+pub const aabb2 = [2]vec2;
+pub const aabb2i = [2]vec2i;
+pub const aabb2u = [2]vec2u;
+pub const aabb3 = [2]vec3;
+pub const aabb3i = [2]vec3i;
+pub const aabb3u = [2]vec3u;
+
+pub const vec2 = @Vector(2, f32);
+pub const vec3 = @Vector(3, f32);
+pub const vec4 = @Vector(4, f32);
+pub const vec2d = @Vector(2, f64);
+pub const vec3d = @Vector(3, f64);
+pub const vec4d = @Vector(4, f64);
+pub const vec2i = @Vector(2, i32);
+pub const vec3i = @Vector(3, i32);
+pub const vec4i = @Vector(4, i32);
+pub const vec2u = @Vector(2, u32);
+pub const vec3u = @Vector(3, u32);
+pub const vec4u = @Vector(4, u32);
+pub const vec2b = @Vector(2, bool);
+pub const vec3b = @Vector(3, bool);
+pub const vec4b = @Vector(4, bool);
+
+pub const Transform2 = struct {
+    pos: vec2 = zero(vec2),
+    rot: f32 = 0.0,
+    scale: vec2 = zero(vec2),
+
+    pub const none = Transform2{};
+};
+
+pub const Transform3 = struct {
+    pos: vec3 = zero(vec3),
+    rot: quat = quat_identity,
+    scale: vec3 = one(vec3),
+
+    pub const none = Transform3{};
+
+    pub fn getFront(self: Transform3) vec3 {
+        return quat_front(self.rot);
+    }
+
+    pub fn getUp(self: Transform3) vec3 {
+        return quat_up(self.rot);
+    }
+
+    pub fn getRight(self: Transform3) vec3 {
+        return quat_right(self.rot);
+    }
+
+    /// Converts the Transform into a 4x4 Matrix.
+    pub fn toMat4(self: Transform3) mat4 {
+        return mat4_compose(self.pos, self.rot, self.scale);
+    }
+
+    /// Converts a 4x4 Matrix into a Transform.
+    /// NOTE: This assumes the matrix is a standard affine transformation matrix
+    /// without shearing or non-uniform mirroring.
+    pub fn fromMat4(mat: mat4) Transform3 {
+        var self = none;
+        mat4_decompose(mat, &self.pos, &self.rot, &self.scale);
+        return self;
+    }
+
+    /// Translates the transform by a vector.
+    pub fn translate(self: *Transform3, translation: vec3) void {
+        self.pos += translation;
+    }
+
+    /// Rotates the transform by combining its current rotation with a new quaternion.
+    pub fn rotate(self: *Transform3, rotation: quat) void {
+        self.rot = normalize(quat_mul(rotation, self.rot));
+    }
+
+    /// Rotates the transform using an axis and angle (in radians).
+    pub fn rotateAxisAngle(self: *Transform3, axis: vec3, angle: f32) void {
+        const q = quat_from_axis_angle(axis, angle);
+        self.rotate(q);
+    }
+};
+
+pub const deg_to_rad = std.math.rad_per_deg;
+pub const rad_to_deg = std.math.deg_per_rad;
+
+pub fn Resize(comptime T: type, n: comptime_int) type {
+    const T_info = @typeInfo(T);
+    return switch (T_info) {
+        .array => |a_info| [n]a_info.child,
+        .vector => |v_info| @Vector(n, v_info.child),
+        else => @compileError("Expected an array or a vector, got " ++ @typeName(T)),
+    };
+}
+
+pub fn swizzle(value: anytype, comptime indices: []const comptime_int) Resize(@TypeOf(value), indices.len) {
+    var out: Resize(@TypeOf(value), indices.len) = undefined;
+    inline for (indices, 0..) |in_index, out_index| {
+        out[out_index] = value[in_index];
+    }
+    return out;
+}
+
+pub fn zero(comptime T: type) T {
+    const T_info = @typeInfo(T);
+    return switch (T_info) {
+        .int, .comptime_int, .comptime_float => 0,
+        .vector => @splat(0),
+        .array => |array_info| @splat(zero(array_info.child)),
+        else => @compileError("Expected a scalar, vector, or array; got " ++ @typeName(T)),
+    };
+}
+
+pub fn one(comptime T: type) T {
+    const T_info = @typeInfo(T);
+    return switch (T_info) {
+        .int, .comptime_int, .comptime_float => 1,
+        .vector => @splat(1),
+        .array => |array_info| @splat(one(array_info.child)),
+        else => @compileError("Expected a scalar, vector, or array; got " ++ @typeName(T)),
+    };
+}
+
+pub fn AVSwap(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .array => |a| return @Vector(a.len, a.child),
+        .vector => |v| return [v.len]v.child,
+        else => @compileError("Expected vector or array; got " ++ @typeName(T)),
+    };
+}
+
+pub fn arrayVectorSwap(a: anytype) AVSwap(@TypeOf(a)) {
+    var out: AVSwap(@TypeOf(a)) = undefined;
+    const n = comptime numComponents(@TypeOf(a));
+    inline for (comptime 0..n) |i| out[i] = a[i];
+    return out;
+}
+
+pub fn eql(a: anytype, b: anytype) bool {
+    const T = @TypeOf(a);
+    const T_info = @typeInfo(T);
+    const U = @TypeOf(b);
+    const U_info = @typeInfo(U);
+    const x = if (comptime T_info != .vector and U_info == .vector) splat(U, a) else a;
+    const y = if (comptime U_info != .vector and T_info == .vector) splat(T, b) else b;
+    const g = x == y;
+    return if (comptime T_info == .vector or U_info == .vector) all(g) else g;
+}
+
+pub fn any(v: anytype) bool {
+    return @reduce(.Or, v);
+}
+
+pub fn all(v: anytype) bool {
+    return @reduce(.And, v);
+}
+
+pub fn splat(comptime T: type, v: anytype) T {
+    return @splat(v);
+}
+
+pub fn aabb2_from_center_size(c: vec2, size: vec2) aabb2 {
+    const hs = size * linalg.splat(vec2, 0.5);
+    return .{
+        c - hs,
+        c + hs,
+    };
+}
+
+pub fn aabb2_from_top_left_size(tl: vec2, size: vec2) aabb2 {
+    return .{
+        tl,
+        tl + size,
+    };
+}
+
+/// get the smallest AABB that contains both a and b
+pub fn aabb_union(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    return .{
+        @min(a[0], b[0]),
+        @max(a[1], b[1]),
+    };
+}
+
+/// get the overlapping region of a and b, or null if they don't overlap.
+pub fn aabb_intersect(a: anytype, b: @TypeOf(a)) ?@TypeOf(a) {
+    const intersect_min = @max(a[0], b[0]);
+    const intersect_max = @min(a[1], b[1]);
+
+    // An invalid AABB means there was no overlap.
+    if (@reduce(.And, intersect_min <= intersect_max)) {
+        return .{ intersect_min, intersect_max };
+    } else {
+        return null;
+    }
+}
+
+/// check if a and b have any overlap
+pub fn aabb_overlapping(a: anytype, b: @TypeOf(a)) bool {
+    const less_than = a[1] < b[0];
+    const greater_than = a[0] > b[1];
+
+    return !(any(less_than) or any(greater_than));
+}
+
+/// check if b is completely inside a
+pub fn aabb_contains(a: anytype, b: @TypeOf(a)) bool {
+    const less_than = a[0] <= b[0];
+    const greater_than = a[1] >= b[1];
+    return all(less_than) and all(greater_than);
+}
+
+/// check if a point is inside the aabb
+pub fn aabb_contains_point(aabb: anytype, point: Component(@TypeOf(aabb))) bool {
+    return !(any(point < aabb[0]) or any(point > aabb[1]));
+}
+
+/// Get the squared Euclidean distance from a point to the nearest point on/in the AABB.
+/// Returns 0 if the point is inside the box. Works with integer vectors!
+pub fn aabb_sq_dist(aabb: anytype, point: Component(@TypeOf(aabb))) Component(Component(@TypeOf(aabb))) {
+    const V = @TypeOf(point);
+    const zeros: V = @splat(0);
+
+    const d_min = aabb[0] - point;
+    const d_max = point - aabb[1];
+    const q = @max(d_min, d_max);
+
+    // Clamp negative values to zero (points inside become 0)
+    const q_outside = @max(q, zeros);
+
+    // Sum of squares across all axes
+    return @reduce(.Add, q_outside * q_outside);
+}
+
+/// get the signed distance from an aabb to a point
+pub fn aabb_sdf(aabb: anytype, point: Component(aabb)) Component(Component(aabb)) {
+    const V = @TypeOf(point);
+
+    // Get the distance from the point to the min and max planes on each axis.
+    // This is mathematically equivalent to `abs(point - center) - half_extents`.
+    const d_min = aabb[0] - point;
+    const d_max = point - aabb[1];
+    const q = @max(d_min, d_max);
+
+    // Calculate the outside distance (Euclidean distance to the corner/edge)
+    const q_outside = @max(q, zero(V));
+    const dist_outside = @sqrt(@reduce(.Add, q_outside * q_outside));
+
+    // Calculate the inside distance (Negative distance to the closest boundary)
+    const max_q = @reduce(.Max, q);
+    const dist_inside = @min(max_q, 0);
+
+    return dist_outside + dist_inside;
+}
+
+/// Convert a value to a vector type, or leave it in place and coerce if it is already a vector
+pub fn upcast(comptime T: type, v: anytype) T {
+    const U = @TypeOf(v);
+    const U_info = @typeInfo(U);
+    return if (comptime U_info == .vector) v else @splat(v);
+}
+
+pub fn Extend(comptime T: type) type {
+    const v_info = @typeInfo(T).vector;
+    return @Vector(v_info.len + 1, v_info.child);
+}
+
+/// Append a scalar to a vector type
+pub fn extend(v: anytype, s: @typeInfo(@TypeOf(v)).vector.child) Extend(@TypeOf(v)) {
+    const T = @TypeOf(v);
+    const U = Extend(T);
+    const N = comptime numComponents(T);
+    var out: U = undefined;
+    inline for (0..N) |i| {
+        out[i] = v[i];
+    }
+    out[N] = s;
+    return out;
+}
+
+/// N-dimensional dot product on vectors
+pub fn dot(a: anytype, b: @TypeOf(a)) @typeInfo(@TypeOf(a)).vector.child {
+    var result: @typeInfo(@TypeOf(a)).vector.child = 0.0;
+    inline for (0..comptime numComponents(@TypeOf(a))) |i| {
+        result += a[i] * b[i];
+    }
+    return result;
+}
+
+/// get the magnitude of an n-dimensional vector
+pub fn len(v: anytype) @typeInfo(@TypeOf(v)).vector.child {
+    return std.math.sqrt(dot(v, v));
+}
+
+/// get the square of the magnitude of an n-dimensional vector
+pub fn len_sq(v: anytype) @typeInfo(@TypeOf(v)).vector.child {
+    return dot(v, v);
+}
+
+/// N-dimensional vector normalization
+pub fn normalize(v: anytype) @TypeOf(v) {
+    const l = len(v);
+    if (l == 0) return v;
+    var result: @TypeOf(v) = undefined;
+    inline for (0..comptime numComponents(@TypeOf(v))) |i| {
+        result[i] = v[i] / l;
+    }
+    return result;
+}
+
+/// Cross product for vector3 only
+pub fn vec3_cross(a: vec3, b: vec3) vec3 {
+    return .{
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+/// Linear interpolate two N-dimensional vectors by at an N-dimensional vector or scalar delta
+pub fn lerp(a: anytype, b: @TypeOf(a), t: anytype) @TypeOf(a) {
+    const tv = upcast(@TypeOf(a), t);
+    return a + (b - a) * tv;
+}
+
+/// Compare two vectors for approximate equality, with an absolute tolerance
+pub fn approxEqAbs(a: anytype, b: @TypeOf(a), epsilon: anytype) bool {
+    const T = @TypeOf(a);
+    const S = @typeInfo(T).vector.child;
+    const eps = upcast(T, epsilon);
+    inline for (0..comptime numComponents(T)) |i| {
+        if (!std.math.approxEqAbs(S, a[i], b[i], eps[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Determine if a type is a collection
+pub fn hasComponents(comptime V: type) bool {
+    return switch (@typeInfo(V)) {
+        .array => true,
+        .vector => true,
+        .@"struct" => true,
+        .optional => true,
+        .pointer => true,
+        .error_union => true,
+        else => false,
+    };
+}
+
+/// Get the number of elements in a collection type
+pub fn numComponents(comptime T: type) usize {
+    return switch (@typeInfo(T)) {
+        .vector => |v| v.len,
+        .array => |a| a.len,
+        .@"struct" => |s| s.fields.len,
+        .optional => 1,
+        .pointer => 1,
+        .error_union => 1,
+        else => |k| @compileError("Expected a collection type, got type `" ++ @typeName(T) ++ "` of kind " ++ @tagName(k)),
+    };
+}
+
+/// Extract the component type of a collection type
+pub fn Component(comptime V: type) type {
+    return switch (@typeInfo(V)) {
+        .array => |x| x.child,
+        .vector => |x| x.child,
+        .optional => |x| x.child,
+        .pointer => |x| x.child,
+        .error_union => |x| x.payload,
+        .@"struct" => |x| {
+            comptime if (x.fields.len < 2) @compileError("Expected a vector-like struct, got type `" ++ @typeName(V) ++ "`, a unary/nullary structure.");
+            const T = comptime x.fields[0].type;
+            comptime for (x.fields[1..]) |field| if (T != field.type) @compileError("Expected a vector-like struct, got type `" ++ @typeName(V) ++ "`, a heterogeneous structure.");
+            return T;
+        },
+        else => |k| @compileError("Expected a collection type (array, vector, optional, error_union, pointer); got type `" ++ @typeName(V) ++ "` of kind " ++ @tagName(k)),
+    };
+}
+
+/// Create a new N-dimensional vector from another vector or a scalar
+pub fn ExtrapolateComponent(comptime N: usize, comptime T: type) type {
+    return @Vector(N, if (hasComponents(T)) Component(T) else T);
+}
+
+/// Extract the first three components of a vector, or splat a scalar to three components
+pub fn xyz(v: anytype) ExtrapolateComponent(3, @TypeOf(v)) {
+    const T = @TypeOf(v);
+    const T_info = @typeInfo(T);
+
+    var out: ExtrapolateComponent(3, T) = undefined;
+    if (comptime T_info == .vector) {
+        if (T_info.vector.len < 3) @compileError("linalg.xyz requires at least 3 components or a scalar");
+        inline for (0..3) |i| {
+            out[i] = v[i];
+        }
+    } else {
+        inline for (0..3) |i| {
+            out[i] = v;
+        }
+    }
+
+    return out;
+}
+
+/// A 4x4 identity matrix.
+pub const mat4_identity =
+    mat4{
+        .{ 1, 0, 0, 0 },
+        .{ 0, 1, 0, 0 },
+        .{ 0, 0, 1, 0 },
+        .{ 0, 0, 0, 1 },
+    };
+
+/// A quaternion representing no rotation.
+pub const quat_identity = quat{ 0, 0, 0, 1 };
+
+/// Transforms a vector by a 4x4 matrix.
+/// If `v` is a vec3, it is treated as a point with w=1.0.
+/// If `v` is a vec4, a standard matrix-vector multiplication is performed.
+pub fn mat4_apply(m: mat4, v: anytype) @TypeOf(v) {
+    const T = @TypeOf(v);
+    const n = comptime numComponents(T);
+
+    if (n == 3) {
+        const x: vec4 = @splat(v[0]);
+        const y: vec4 = @splat(v[1]);
+        const z: vec4 = @splat(v[2]);
+
+        // Treat as point (w=1): col0*x + col1*y + col2*z + col3
+        const res = m[0] * x + m[1] * y + m[2] * z + m[3];
+        return xyz(res);
+    } else if (n == 4) {
+        const x: vec4 = @splat(v[0]);
+        const y: vec4 = @splat(v[1]);
+        const z: vec4 = @splat(v[2]);
+        const w: vec4 = @splat(v[3]);
+
+        // Standard multiplication: col0*x + col1*y + col2*z + col3*w
+        return m[0] * x + m[1] * y + m[2] * z + m[3] * w;
+    } else {
+        @compileError("mat4_apply requires a vec3 or vec4");
+    }
+}
+
+/// Computes the inverse of a 4x4 matrix.
+/// Returns null if the determinant is zero (singular matrix).
+pub fn mat4_inverse(m: mat4) ?mat4 {
+    var out: mat4 = undefined;
+
+    // Calculate only the first column of the adjugate matrix first.
+    // These values correspond to the cofactors of the first row of m,
+    // which allows us to compute the determinant by expanding along that row.
+    out[0][0] = m[1][1] * m[2][2] * m[3][3] - m[1][1] * m[2][3] * m[3][2] - m[2][1] * m[1][2] * m[3][3] + m[2][1] * m[1][3] * m[3][2] + m[3][1] * m[1][2] * m[2][3] - m[3][1] * m[1][3] * m[2][2];
+    out[0][1] = -m[0][1] * m[2][2] * m[3][3] + m[0][1] * m[2][3] * m[3][2] + m[2][1] * m[0][2] * m[3][3] - m[2][1] * m[0][3] * m[3][2] - m[3][1] * m[0][2] * m[2][3] + m[3][1] * m[0][3] * m[2][2];
+    out[0][2] = m[0][1] * m[1][2] * m[3][3] - m[0][1] * m[1][3] * m[3][2] - m[1][1] * m[0][2] * m[3][3] + m[1][1] * m[0][3] * m[3][2] + m[3][1] * m[0][2] * m[1][3] - m[3][1] * m[0][3] * m[1][2];
+    out[0][3] = -m[0][1] * m[1][2] * m[2][3] + m[0][1] * m[1][3] * m[2][2] + m[1][1] * m[0][2] * m[2][3] - m[1][1] * m[0][3] * m[2][2] - m[2][1] * m[0][2] * m[1][3] + m[2][1] * m[0][3] * m[1][2];
+
+    // Compute determinant
+    const det = m[0][0] * out[0][0] + m[1][0] * out[0][1] + m[2][0] * out[0][2] + m[3][0] * out[0][3];
+
+    if (det == 0.0) return null;
+
+    // Calculate the remaining columns of the adjugate matrix
+    out[1][0] = -m[1][0] * m[2][2] * m[3][3] + m[1][0] * m[2][3] * m[3][2] + m[2][0] * m[1][2] * m[3][3] - m[2][0] * m[1][3] * m[3][2] - m[3][0] * m[1][2] * m[2][3] + m[3][0] * m[1][3] * m[2][2];
+    out[1][1] = m[0][0] * m[2][2] * m[3][3] - m[0][0] * m[2][3] * m[3][2] - m[2][0] * m[0][2] * m[3][3] + m[2][0] * m[0][3] * m[3][2] + m[3][0] * m[0][2] * m[2][3] - m[3][0] * m[0][3] * m[2][2];
+    out[1][2] = -m[0][0] * m[1][2] * m[3][3] + m[0][0] * m[1][3] * m[3][2] + m[1][0] * m[0][2] * m[3][3] - m[1][0] * m[0][3] * m[3][2] - m[3][0] * m[0][2] * m[1][3] + m[3][0] * m[0][3] * m[1][2];
+    out[1][3] = m[0][0] * m[1][2] * m[2][3] - m[0][0] * m[1][3] * m[2][2] - m[1][0] * m[0][2] * m[2][3] + m[1][0] * m[0][3] * m[2][2] + m[2][0] * m[0][2] * m[1][3] - m[2][0] * m[0][3] * m[1][2];
+
+    out[2][0] = m[1][0] * m[2][1] * m[3][3] - m[1][0] * m[2][3] * m[3][1] - m[2][0] * m[1][1] * m[3][3] + m[2][0] * m[1][3] * m[3][1] + m[3][0] * m[1][1] * m[2][3] - m[3][0] * m[1][3] * m[2][1];
+    out[2][1] = -m[0][0] * m[2][1] * m[3][3] + m[0][0] * m[2][3] * m[3][1] + m[2][0] * m[0][1] * m[3][3] - m[2][0] * m[0][3] * m[3][1] - m[3][0] * m[0][1] * m[2][3] + m[3][0] * m[0][3] * m[2][1];
+    out[2][2] = m[0][0] * m[1][1] * m[3][3] - m[0][0] * m[1][3] * m[3][1] - m[1][0] * m[0][1] * m[3][3] + m[1][0] * m[0][3] * m[3][1] + m[3][0] * m[0][1] * m[1][3] - m[3][0] * m[0][3] * m[1][1];
+    out[2][3] = -m[0][0] * m[1][1] * m[2][3] + m[0][0] * m[1][3] * m[2][1] + m[1][0] * m[0][1] * m[2][3] - m[1][0] * m[0][3] * m[2][1] - m[2][0] * m[0][1] * m[1][3] + m[2][0] * m[0][3] * m[1][1];
+
+    out[3][0] = -m[1][0] * m[2][1] * m[3][2] + m[1][0] * m[2][2] * m[3][1] + m[2][0] * m[1][1] * m[3][2] - m[2][0] * m[1][2] * m[3][1] - m[3][0] * m[1][1] * m[2][2] + m[3][0] * m[1][2] * m[2][1];
+    out[3][1] = m[0][0] * m[2][1] * m[3][2] - m[0][0] * m[2][2] * m[3][1] - m[2][0] * m[0][1] * m[3][2] + m[2][0] * m[0][2] * m[3][1] + m[3][0] * m[0][1] * m[2][2] - m[3][0] * m[0][2] * m[2][1];
+    out[3][2] = -m[0][0] * m[1][1] * m[3][2] + m[0][0] * m[1][2] * m[3][1] + m[1][0] * m[0][1] * m[3][2] - m[1][0] * m[0][2] * m[3][1] - m[3][0] * m[0][1] * m[1][2] + m[3][0] * m[0][2] * m[1][1];
+    out[3][3] = m[0][0] * m[1][1] * m[2][2] - m[0][0] * m[1][2] * m[2][1] - m[1][0] * m[0][1] * m[2][2] + m[1][0] * m[0][2] * m[2][1] + m[2][0] * m[0][1] * m[1][2] - m[2][0] * m[0][2] * m[1][1];
+
+    const invDet = @as(vec4, @splat(1.0 / det));
+
+    out[0] *= invDet;
+    out[1] *= invDet;
+    out[2] *= invDet;
+    out[3] *= invDet;
+
+    return out;
+}
+
+/// Multiplies two 4x4 matrices (self * other).
+pub fn mat4_mul(m1: mat4, m2: mat4) mat4 {
+    var out: mat4 = @splat(@splat(0.0));
+    comptime var c: usize = 0;
+    inline while (c < 4) : (c += 1) {
+        comptime var r: usize = 0;
+        inline while (r < 4) : (r += 1) {
+            // zig fmt: off
+            out[c][r] 
+                = m1[0][r] * m2[c][0]
+                + m1[1][r] * m2[c][1]
+                + m1[2][r] * m2[c][2]
+                + m1[3][r] * m2[c][3];
+            // zig fmt: on
+        }
+    }
+    return out;
+}
+
+/// Creates a view matrix that looks from `eye` towards `center`.
+pub fn mat4_look_at(eye: vec3, center: vec3, up: vec3) mat4 {
+    const f = normalize(center - eye);
+    const s = normalize(vec3_cross(f, up));
+    const u = vec3_cross(s, f);
+
+    // Note: The view matrix is the inverse of the camera's transformation matrix.
+    // This results in the basis vectors (s, u, -f) being laid out in rows
+    // of the conceptual matrix, which means they are spread across the columns
+    // in our column-major memory layout.
+    return mat4{
+        // Column 0
+        .{ s[0], u[0], -f[0], 0 },
+        // Column 1
+        .{ s[1], u[1], -f[1], 0 },
+        // Column 2
+        .{ s[2], u[2], -f[2], 0 },
+        // Column 3
+        .{ -dot(s, eye), -dot(u, eye), dot(f, eye), 1 },
+    };
+}
+
+/// Creates a perspective projection matrix.
+///
+/// This implementation is specifically for APIs like Vulkan, Metal, and WGPU
+/// that use a depth range of [0, 1], unlike OpenGL's [-1, 1].
+///
+/// Parameters:
+/// - `fovy_rad`: Vertical field of view in radians.
+/// - `aspect`: Aspect ratio of the viewport (width / height).
+/// - `z_near`: Distance to the near clipping plane (must be positive).
+/// - `z_far`: Distance to the far clipping plane (must be positive).
+pub fn mat4_perspective(fovy_rad: f32, aspect: f32, z_near: f32, z_far: f32) mat4 {
+    const f = 1.0 / std.math.tan(fovy_rad / 2.0);
+    const nf = z_near - z_far;
+
+    return mat4{
+        // Column 0
+        .{ f / aspect, 0, 0, 0 },
+        // Column 1
+        .{ 0, -f, 0, 0 },
+        // Column 2
+        .{ 0, 0, z_far / nf, -1 },
+        // Column 3
+        .{ 0, 0, (z_far * z_near) / nf, 0 },
+    };
+}
+
+/// Creates an orthographic projection matrix.
+pub fn mat4_ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) mat4 {
+    const rml = right - left;
+    const tmb = top - bottom;
+    const fmn = far - near;
+
+    var res = mat4_identity;
+    res[0][0] = 2.0 / rml;
+    res[1][1] = 2.0 / tmb;
+    res[2][2] = -1.0 / fmn; // Use -1 for [0, 1] depth range
+    res[3][0] = -(right + left) / rml;
+    res[3][1] = -(top + bottom) / tmb;
+    res[3][2] = -near / fmn;
+    return res;
+}
+
+/// Creates a 4x4 matrix from translation, rotation and scale components
+pub fn mat4_compose(t: vec3, r: quat, s: vec3) mat4 {
+    return linalg.mat4_mul(linalg.mat4_mul(linalg.mat4_translate(t), linalg.mat4_from_quat(r)), linalg.mat4_scale(s));
+}
+
+/// Decomposes a 4x4 matrix into translation, rotation, and scale components.
+/// NOTE: This assumes the matrix is a standard affine transformation matrix
+/// without shearing or non-uniform mirroring.
+pub fn mat4_decompose(m: mat4, out_pos: ?*vec3, out_rot: ?*quat, out_scl: ?*vec3) void {
+    const pos = xyz(m[3]);
+
+    const c0 = xyz(m[0]);
+    const c1 = xyz(m[1]);
+    const c2 = xyz(m[2]);
+
+    const scl = vec3{ len(c0), len(c1), len(c2) };
+
+    const x_axis = if (scl[0] != 0.0) c0 / @as(vec3, @splat(scl[0])) else vec3{ 1, 0, 0 };
+    const y_axis = if (scl[1] != 0.0) c1 / @as(vec3, @splat(scl[1])) else vec3{ 0, 1, 0 };
+    const z_axis = if (scl[2] != 0.0) c2 / @as(vec3, @splat(scl[2])) else vec3{ 0, 0, 1 };
+
+    const rot = quat_from_axes(x_axis, y_axis, z_axis);
+
+    if (out_pos) |p| p.* = pos;
+    if (out_rot) |r| r.* = rot;
+    if (out_scl) |s| s.* = scl;
+}
+
+/// Creates a 4x4 translation matrix.
+pub fn mat4_translate(translation: vec3) mat4 {
+    var m = mat4_identity;
+    m[3] = .{ translation[0], translation[1], translation[2], 1.0 };
+    return m;
+}
+
+/// Creates a 4x4 scaling matrix.
+pub fn mat4_scale(s: vec3) mat4 {
+    var m = mat4_identity;
+    m[0][0] = s[0];
+    m[1][1] = s[1];
+    m[2][2] = s[2];
+    return m;
+}
+
+/// Creates a 4x4 rotation matrix from a quaternion.
+/// The quaternion is assumed to have components (x, y, z, w).
+pub fn mat4_from_quat(q: quat) mat4 {
+    const nq = normalize(q);
+    const x = nq[0];
+    const y = nq[1];
+    const z = nq[2];
+    const w = nq[3];
+
+    const xx = x * x;
+    const yy = y * y;
+    const zz = z * z;
+    const xy = x * y;
+    const xz = x * z;
+    const yz = y * z;
+    const wx = w * x;
+    const wy = w * y;
+    const wz = w * z;
+
+    var out: mat4 = undefined;
+
+    // Column 0
+    out[0][0] = 1.0 - 2.0 * (yy + zz);
+    out[0][1] = 2.0 * (xy + wz);
+    out[0][2] = 2.0 * (xz - wy);
+    out[0][3] = 0.0;
+
+    // Column 1
+    out[1][0] = 2.0 * (xy - wz);
+    out[1][1] = 1.0 - 2.0 * (xx + zz);
+    out[1][2] = 2.0 * (yz + wx);
+    out[1][3] = 0.0;
+
+    // Column 2
+    out[2][0] = 2.0 * (xz + wy);
+    out[2][1] = 2.0 * (yz - wx);
+    out[2][2] = 1.0 - 2.0 * (xx + yy);
+    out[2][3] = 0.0;
+
+    // Column 3
+    out[3] = .{ 0.0, 0.0, 0.0, 1.0 };
+
+    return out;
+}
+
+/// Cubic hermite interpolation on 3-dimensional vectors; delta may be either another vec3 or a scalar
+pub fn vec3_interp_cubic(v1: vec3, tangent1: vec3, v2: vec3, tangent2: vec3, t: anytype) vec3 {
+    const tv = upcast(quat, t);
+
+    const t2 = tv * tv;
+    const t3 = tv * tv * tv;
+
+    const two: vec3 = @splat(2);
+    const three: vec3 = @splat(3);
+
+    // zig fmt: off
+    return (two * t3 - three * t2 + one(vec3)) * v1
+         + (t3 - two * t2 + tv) * tangent1
+         + (-two * t3 + three * t2) * v2
+         + (t3 - t2) * tangent2
+         ;
+    // zig fmt: on
+}
+
+/// Spherical linear interpolation on 3-dimensional vectors; delta may be either another vec3 or a scalar
+pub fn quat_slerp(q1: quat, q2: quat, t: anytype) quat {
+    const tv = upcast(quat, t);
+
+    // Ensure quaternions are normalized
+    const temp_q1 = normalize(q1);
+    var temp_q2 = normalize(q2);
+
+    var d = dot(temp_q1, temp_q2);
+
+    // If dot product is negative, negate one quaternion to take the shortest path
+    if (d < 0.0) {
+        temp_q2 = -temp_q2;
+        d = -d; // Recalculate d product (now positive)
+    }
+
+    // Handle near-parallel quaternions to avoid division by zero
+    const DOT_THRESHOLD = 0.9995;
+    if (d > DOT_THRESHOLD) {
+        // Linear interpolation (LERP) as an approximation
+        return normalize(temp_q1 + tv * (temp_q2 - temp_q1));
+    }
+
+    const theta = std.math.acos(d);
+    const sin_theta = std.math.sin(theta);
+
+    var out: quat = undefined;
+
+    inline for (0..4) |i| {
+        const s0 = std.math.sin((1.0 - tv[i]) * theta) / sin_theta;
+        const s1 = std.math.sin(tv[i] * theta) / sin_theta;
+        out[i] = s0 * temp_q1[i] + s1 * temp_q2[i];
+    }
+
+    return out;
+}
+
+/// Cubic hermite interpolation on quaternions; delta may be either another quat or a scalar
+pub fn quat_interp_cubic(q1: quat, outTangent1: quat, q2: quat, inTangent2: quat, t: anytype) quat {
+    const tv = upcast(quat, t);
+
+    const t2 = tv * tv;
+    const t3 = t2 * tv;
+
+    const two: quat = @splat(2);
+    const three: quat = @splat(3);
+
+    const h00: quat = two * t3 - three * t2 + one(quat);
+    const h10: quat = t3 - two * t2 + t;
+    const h01: quat = -two * t3 + three * t2;
+    const h11: quat = t3 - t2;
+
+    const p0 = q1 * h00;
+    const m0 = outTangent1 * h10;
+    const p1 = q2 * h01;
+    const m1 = inTangent2 * h11;
+
+    return normalize(p0 + m0 + p1 + m1);
+}
+
+/// Multiplies two quaternions (q1 * q2).
+/// Useful for combining rotations.
+pub fn quat_mul(q1: quat, q2: quat) quat {
+    return .{
+        q1[3] * q2[0] + q1[0] * q2[3] + q1[1] * q2[2] - q1[2] * q2[1],
+        q1[3] * q2[1] - q1[0] * q2[2] + q1[1] * q2[3] + q1[2] * q2[0],
+        q1[3] * q2[2] + q1[0] * q2[1] - q1[1] * q2[0] + q1[2] * q2[3],
+        q1[3] * q2[3] - q1[0] * q2[0] - q1[1] * q2[1] - q1[2] * q2[2],
+    };
+}
+
+/// Computes the conjugate of a quaternion.
+/// For a normalized quaternion, this is identical to its inverse.
+pub fn quat_conjugate(q: quat) quat {
+    return .{ -q[0], -q[1], -q[2], q[3] };
+}
+
+/// Rotates a 3D vector by a quaternion.
+pub fn quat_rotate_vec3(q: quat, v: vec3) vec3 {
+    // Fast vector rotation using: v' = v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+    const q_xyz = vec3{ q[0], q[1], q[2] };
+    const q_w = q[3];
+
+    const uv = vec3_cross(q_xyz, v);
+    const uuv = vec3_cross(q_xyz, uv);
+
+    const s_uv = @as(vec3, @splat(q_w * 2.0)) * uv;
+    const two_uuv = @as(vec3, @splat(2.0)) * uuv;
+
+    return v + s_uv + two_uuv;
+}
+
+/// Creates a quaternion from an axis and an angle (in radians).
+pub fn quat_from_axis_angle(axis: vec3, angle: f32) quat {
+    const half_angle = angle * 0.5;
+    const s = std.math.sin(half_angle);
+    const n = normalize(axis);
+
+    return .{ n[0] * s, n[1] * s, n[2] * s, std.math.cos(half_angle) };
+}
+
+/// Converts Euler angles (pitch, yaw, roll in radians) to a quaternion.
+/// Applies rotations in standard order.
+pub fn quat_from_euler(pitch: f32, yaw: f32, roll: f32) quat {
+    const cy = std.math.cos(yaw * 0.5);
+    const sy = std.math.sin(yaw * 0.5);
+    const cp = std.math.cos(pitch * 0.5);
+    const sp = std.math.sin(pitch * 0.5);
+    const cr = std.math.cos(roll * 0.5);
+    const sr = std.math.sin(roll * 0.5);
+
+    return .{
+        sr * cp * cy - cr * sp * sy, // x
+        cr * sp * cy + sr * cp * sy, // y
+        cr * cp * sy - sr * sp * cy, // z
+        cr * cp * cy + sr * sp * sy, // w
+    };
+}
+
+/// Converts a quaternion to Euler angles (pitch, yaw, roll in radians).
+pub fn quat_to_euler(q: quat) vec3 {
+    var angles: vec3 = undefined;
+
+    // Pitch (x-axis rotation)
+    const sinp_cosr = 2.0 * (q[3] * q[0] + q[1] * q[2]);
+    const cosp_cosr = 1.0 - 2.0 * (q[0] * q[0] + q[1] * q[1]);
+    angles[0] = std.math.atan2(sinp_cosr, cosp_cosr);
+
+    // Yaw (y-axis rotation)
+    const siny = 2.0 * (q[3] * q[1] - q[2] * q[0]);
+    if (@abs(siny) >= 1.0) {
+        angles[1] = std.math.copysign(@as(f32, std.math.pi / 2.0), siny);
+    } else {
+        angles[1] = std.math.asin(siny);
+    }
+
+    // Roll (z-axis rotation)
+    const sinr_cosy = 2.0 * (q[3] * q[2] + q[0] * q[1]);
+    const cosr_cosy = 1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2]);
+    angles[2] = std.math.atan2(sinr_cosy, cosr_cosy);
+
+    return angles;
+}
+
+/// Creates a quaternion from orthonormal basis axes (X, Y, Z).
+pub fn quat_from_axes(x_axis: vec3, y_axis: vec3, z_axis: vec3) quat {
+    // x_axis is column 0, y_axis is column 1, z_axis is column 2
+    const m00 = x_axis[0];
+    const m01 = y_axis[0];
+    const m02 = z_axis[0];
+    const m10 = x_axis[1];
+    const m11 = y_axis[1];
+    const m12 = z_axis[1];
+    const m20 = x_axis[2];
+    const m21 = y_axis[2];
+    const m22 = z_axis[2];
+
+    const tr = m00 + m11 + m22;
+    if (tr > 0.0) {
+        const s = std.math.sqrt(tr + 1.0) * 2.0;
+        return .{
+            (m21 - m12) / s, // x
+            (m02 - m20) / s, // y
+            (m10 - m01) / s, // z
+            0.25 * s, // w
+        };
+    } else if ((m00 >= m11) and (m00 >= m22)) {
+        const s = std.math.sqrt(1.0 + m00 - m11 - m22) * 2.0;
+        return .{
+            0.25 * s,
+            (m01 + m10) / s,
+            (m02 + m20) / s,
+            (m21 - m12) / s,
+        };
+    } else if (m11 >= m22) {
+        const s = std.math.sqrt(1.0 + m11 - m00 - m22) * 2.0;
+        return .{
+            (m01 + m10) / s,
+            0.25 * s,
+            (m12 + m21) / s,
+            (m02 - m20) / s,
+        };
+    } else {
+        const s = std.math.sqrt(1.0 + m22 - m00 - m11) * 2.0;
+        return .{
+            (m02 + m20) / s,
+            (m12 + m21) / s,
+            0.25 * s,
+            (m10 - m01) / s,
+        };
+    }
+}
+
+pub fn quat_front(q: quat) vec3 {
+    return quat_rotate_vec3(q, .{ 1, 0, 0 });
+}
+
+pub fn quat_up(q: quat) vec3 {
+    return quat_rotate_vec3(q, .{ 0, 1, 0 });
+}
+
+pub fn quat_right(q: quat) vec3 {
+    return quat_rotate_vec3(q, .{ 0, 0, 1 });
+}
+
+pub fn tri_contains_point(pt: linalg.vec2, v1: linalg.vec2, v2: linalg.vec2, v3: linalg.vec2) bool {
+    const d1 = tri_sign(pt, v1, v2);
+    const d2 = tri_sign(pt, v2, v3);
+    const d3 = tri_sign(pt, v3, v1);
+
+    const has_neg = (d1 < 0.0) or (d2 < 0.0) or (d3 < 0.0);
+    const has_pos = (d1 > 0.0) or (d2 > 0.0) or (d3 > 0.0);
+
+    return !(has_neg and has_pos);
+}
+
+pub fn tri_sign(p1: linalg.vec2, p2: linalg.vec2, p3: linalg.vec2) f32 {
+    return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1]);
+}
