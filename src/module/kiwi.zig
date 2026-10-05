@@ -12,6 +12,12 @@ pub const Image = @import("Image.zig");
 pub const frame = @import("frame.zig");
 pub const linalg = @import("linalg.zig");
 
+export fn rust_eh_personality() callconv(.c) void {
+    // This is a dead stub. If it's ever hit due to an internal Rust engine panic (wasmtime),
+    // we explicitly trap to stop execution safely.
+    @trap();
+}
+
 test {
     _ = base;
     _ = vk;

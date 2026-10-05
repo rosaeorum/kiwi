@@ -1,6 +1,8 @@
-pub fn build(b: *Build) void {
+pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const is_windows = target.result.os.tag == .windows;
 
     var zon_diag = zon.parse.Diagnostics{};
     const zon_data = zon.parse.fromSliceAlloc(
@@ -37,8 +39,38 @@ pub fn build(b: *Build) void {
     const write_vulkan_bindings_source = b.addUpdateSourceFiles();
     write_vulkan_bindings_source.addCopyFileToSource(vulkan_bindings, "src/module/vulkan.zig");
 
-    const bindgen_step = b.step("gen-vk", "run vulkan-zig-generator to update src/module/vulkan.zig");
-    bindgen_step.dependOn(&write_vulkan_bindings_source.step);
+    const vk_bindgen_step = b.step("gen-vk", "run vulkan-zig-generator to update src/module/vulkan.zig");
+    vk_bindgen_step.dependOn(&write_vulkan_bindings_source.step);
+
+    const wasmtime_dep = try if (is_windows)
+        b.dependencyLazy("wasmtime_mingw", .{})
+    else
+        b.dependencyLazy("wasmtime_linux", .{});
+    const wasmtime_include = wasmtime_dep.path("include");
+    const wasmtime_lib = wasmtime_dep.path("lib/libwasmtime.a");
+
+    const translate_c = b.dependency("translate_c", .{}); //
+    const t = Translator.init(translate_c, .{ //
+        .c_source_file = b.addWriteFiles().add(
+            "wasm.c",
+            \\#include "wasm.h"
+            \\#include "wasi.h"
+            \\#include "wasmtime.h"
+            ,
+        ),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    t.addIncludePath(wasmtime_include);
+
+    const wasmtime_bindings = t.output_file;
+
+    const write_wasm_bindings_source = b.addUpdateSourceFiles();
+    write_wasm_bindings_source.addCopyFileToSource(wasmtime_bindings, "src/module/wasm.zig");
+
+    const wasm_bindgen_step = b.step("gen-wasm", "run translate-c to update src/module/wasmtime.zig");
+    wasm_bindgen_step.dependOn(&write_wasm_bindings_source.step);
 
     const glfw_lib = buildGlfw(b, target, optimize, vulkan_headers);
     const vma_lib = buildVma(b, target, optimize);
@@ -82,6 +114,7 @@ pub fn build(b: *Build) void {
 
     kiwi_mod.linkLibrary(glfw_lib);
     kiwi_mod.linkLibrary(vma_lib);
+    kiwi_mod.addObjectFile(wasmtime_lib);
 
     const kiwi_test = b.addTest(.{ .root_module = kiwi_mod });
 
@@ -96,11 +129,14 @@ pub fn build(b: *Build) void {
         .root_source_file = b.path("src/driver.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
     });
 
     driver_mod.addOptions("static_config", static_config);
     driver_mod.linkLibrary(glfw_lib);
     driver_mod.linkLibrary(vma_lib);
+    driver_mod.addObjectFile(wasmtime_lib);
 
     appendStatic(driver_mod);
 
@@ -414,6 +450,7 @@ fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vu
     return lib;
 }
 
+const Translator = @import("translate_c").Translator;
 const base = @import("src/module/base.zig");
 const zon = base.zon;
 const mem = base.mem;
