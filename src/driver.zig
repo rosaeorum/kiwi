@@ -31,7 +31,78 @@ const vertex_data = [6]struct { [2]f32, [2]f32, [3]f32 }{
 };
 // zig fmt: on
 
+const c = @import("module/wasm.zig");
+
 pub fn main() anyerror!void {
+    debug.print("Initializing Wasmtime Engine...\n", .{});
+    const engine = c.wasm_engine_new() orelse {
+        return error.WasmEngineCreationFailed;
+    };
+    defer c.wasm_engine_delete(engine);
+
+    // Create a new store
+    const store = c.wasmtime_store_new(engine, null, null) orelse {
+        return error.WasmStoreCreationFailed;
+    };
+    defer c.wasmtime_store_delete(store);
+    const context = c.wasmtime_store_context(store);
+
+    debug.print("Compiling Wasm module...\n", .{});
+    var module: ?*c.wasmtime_module_t = null;
+    if (c.wasmtime_module_new(engine, @"add.wasm".ptr, @"add.wasm".len, &module)) |err| {
+        defer c.wasmtime_error_delete(err);
+        return error.WasmCompilationFailed;
+    }
+    defer c.wasmtime_module_delete(module);
+
+    debug.print("Instantiating Wasm module...\n", .{});
+    var instance: c.wasmtime_instance_t = undefined;
+    var trap: ?*c.wasm_trap_t = null;
+
+    // Pass null/0 since our basic module doesn't import from the host
+    if (c.wasmtime_instance_new(context, module, null, 0, &instance, &trap)) |err| {
+        defer c.wasmtime_error_delete(err);
+        return error.WasmInstantiationFailed;
+    }
+    if (trap) |t| {
+        defer c.wasm_trap_delete(t);
+        return error.WasmInstantiationTrapped;
+    }
+
+    // Look up the exported "add" function
+    const func_name = "add";
+    var func_obj: c.wasmtime_extern_t = undefined;
+    if (!c.wasmtime_instance_export_get(context, &instance, func_name.ptr, func_name.len, &func_obj)) {
+        return error.WasmExportNotFound;
+    }
+    const func = func_obj.of.func;
+
+    // Prepare arguments and result buffers
+    const args = [_]c.wasmtime_val_t{
+        .{ .kind = c.WASMTIME_I32, .of = .{ .i32 = 40 } },
+        .{ .kind = c.WASMTIME_I32, .of = .{ .i32 = 2 } },
+    };
+    var results: c.wasmtime_val_t = undefined;
+
+    debug.print("Invoking exported function '{s}'(40, 2)...\n", .{func_name});
+    if (c.wasmtime_func_call(context, &func, &args, args.len, &results, 1, &trap)) |err| {
+        defer c.wasmtime_error_delete(err);
+        return error.WasmCallFailed;
+    }
+    if (trap) |t| {
+        defer c.wasm_trap_delete(t);
+        return error.WasmCallTrapped;
+    }
+
+    // Display result
+    if (results.kind == c.WASMTIME_I32) {
+        debug.print("Result: {}\n", .{results.of.i32});
+    } else {
+        debug.print("Unexpected return type\n", .{});
+    }
+}
+
+pub fn gfx_main() anyerror!void {
     var client = try Client.init(&.{
         .application_name = "🥝 engine example app",
         .application_version = .{ .major = 0, .minor = 0, .patch = 0 },
@@ -187,6 +258,7 @@ test {
     _ = main;
 }
 
+const @"add.wasm": []const u8 = @embedFile("add.wasm");
 const @"vert.spv": []const u32 = @ptrCast(@alignCast(@embedFile("vert.spv")));
 const @"frag.spv": []const u32 = @ptrCast(@alignCast(@embedFile("frag.spv")));
 const @"image.png": []const u8 = @embedFile("image.png");

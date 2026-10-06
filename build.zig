@@ -47,7 +47,7 @@ pub fn build(b: *Build) !void {
     else
         b.dependencyLazy("wasmtime_linux", .{});
     const wasmtime_include = wasmtime_dep.path("include");
-    const wasmtime_lib = wasmtime_dep.path("lib/libwasmtime.a");
+    const wasmtime_lib_path = wasmtime_dep.path("lib/");
 
     const translate_c_dep = b.dependency("translate_c", .{});
     const t = Translator.init(translate_c_dep, .{
@@ -113,7 +113,8 @@ pub fn build(b: *Build) !void {
     kiwi_mod.addOptions("static_config", static_config);
     kiwi_mod.linkLibrary(glfw_lib);
     kiwi_mod.linkLibrary(vma_lib);
-    kiwi_mod.addObjectFile(wasmtime_lib);
+    kiwi_mod.addLibraryPath(wasmtime_lib_path);
+    kiwi_mod.linkSystemLibrary("wasmtime", .{});
     kiwi_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
     kiwi_mod.addImport("helpers", translate_c_dep.module("helpers"));
 
@@ -137,7 +138,8 @@ pub fn build(b: *Build) !void {
     driver_mod.addOptions("static_config", static_config);
     driver_mod.linkLibrary(glfw_lib);
     driver_mod.linkLibrary(vma_lib);
-    driver_mod.addObjectFile(wasmtime_lib);
+    driver_mod.addLibraryPath(wasmtime_lib_path);
+    driver_mod.linkSystemLibrary("wasmtime", .{});
     driver_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
     driver_mod.addImport("helpers", translate_c_dep.module("helpers"));
 
@@ -156,6 +158,11 @@ pub fn build(b: *Build) !void {
 }
 
 fn appendStatic(mod: *Build.Module) void {
+    mod.addAnonymousImport("add.wasm", .{
+        .root_source_file = addZigScript(mod.owner, "add", mod.owner.path("static/script/add.zig")),
+        //compileGlsl(mod.owner, mod.owner.path("static/shader/min.vert")),
+    });
+
     mod.addAnonymousImport("vert.spv", .{
         .root_source_file = addZigShader(mod.owner, "vert", mod.owner.path("static/shader/min.zig"), false),
         //compileGlsl(mod.owner, mod.owner.path("static/shader/min.vert")),
@@ -253,6 +260,32 @@ fn spvPatcher(
         });
     }
     return patcher.?;
+}
+
+fn addZigScript(
+    b: *Build,
+    name: []const u8,
+    script_source: Build.LazyPath,
+) Build.LazyPath {
+    const shader_mod = b.createModule(.{
+        .root_source_file = script_source,
+        .target = b.resolveTargetQuery(base.Target.Query.parse(.{
+            .arch_os_abi = "wasm32-freestanding",
+        }) catch |err| base.debug.panic("failed to configure wasm target: {s}", .{@errorName(err)})),
+        .optimize = .fast,
+    });
+
+    const script_obj = b.addExecutable(.{
+        .name = name,
+        .root_module = shader_mod,
+        .use_llvm = false,
+        .use_lld = false,
+    });
+
+    script_obj.entry = .disabled;
+    script_obj.rdynamic = true;
+
+    return script_obj.getEmittedBin();
 }
 
 fn addZigShader(
