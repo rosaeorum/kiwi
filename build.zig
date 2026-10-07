@@ -150,19 +150,48 @@ pub fn build(b: *Build) !void {
         .root_module = driver_mod,
     });
 
+    check_step.dependOn(&driver_exe.step);
+    test_step.dependOn(&driver_exe.step);
+
+    if (is_windows) {
+        driver_exe.step.dependOn(&b.addInstallBinFile(wasmtime_lib_path.path(b, "wasmtime.dll"), "wasmtime.dll").step);
+    }
+
     b.installArtifact(driver_exe);
 
     const driver_run = b.addRunArtifact(driver_exe);
     const run_step = b.step("run", "Run the driver");
     run_step.dependOn(&driver_run.step);
+
+    const memswap_poc_mod = b.createModule(.{
+        .root_source_file = b.path("src/memswap-poc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    memswap_poc_mod.addLibraryPath(wasmtime_lib_path);
+    memswap_poc_mod.linkSystemLibrary("wasmtime", .{});
+    memswap_poc_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
+    memswap_poc_mod.addImport("helpers", translate_c_dep.module("helpers"));
+
+    memswap_poc_mod.addAnonymousImport("guest.wasm", .{
+        .root_source_file = addZigScript(b, "mem", b.path("static/script/mem.zig")),
+    });
+
+    const memswap_poc_test = b.addTest(.{ .root_module = memswap_poc_mod });
+
+    if (is_windows) {
+        memswap_poc_test.step.dependOn(&b.addInstallBinFile(wasmtime_lib_path.path(b, "wasmtime.dll"), "wasmtime.dll").step);
+    }
+
+    const memswap_poc_test_run = b.addRunArtifact(memswap_poc_test);
+
+    check_step.dependOn(&memswap_poc_test.step);
+    test_step.dependOn(&memswap_poc_test_run.step);
 }
 
 fn appendStatic(mod: *Build.Module) void {
-    mod.addAnonymousImport("add.wasm", .{
-        .root_source_file = addZigScript(mod.owner, "add", mod.owner.path("static/script/add.zig")),
-        //compileGlsl(mod.owner, mod.owner.path("static/shader/min.vert")),
-    });
-
     mod.addAnonymousImport("vert.spv", .{
         .root_source_file = addZigShader(mod.owner, "vert", mod.owner.path("static/shader/min.zig"), false),
         //compileGlsl(mod.owner, mod.owner.path("static/shader/min.vert")),
@@ -267,19 +296,28 @@ fn addZigScript(
     name: []const u8,
     script_source: Build.LazyPath,
 ) Build.LazyPath {
+    const target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        // Enforce the multi-memory feature flag
+        .cpu_features_add = feats: {
+            var feats = base.Target.Cpu.Feature.Set.empty;
+            feats.addFeature(@intFromEnum(base.Target.wasm.Feature.multimemory));
+            break :feats feats;
+        },
+    });
+
     const shader_mod = b.createModule(.{
         .root_source_file = script_source,
-        .target = b.resolveTargetQuery(base.Target.Query.parse(.{
-            .arch_os_abi = "wasm32-freestanding",
-        }) catch |err| base.debug.panic("failed to configure wasm target: {s}", .{@errorName(err)})),
+        .target = target,
         .optimize = .fast,
     });
 
     const script_obj = b.addExecutable(.{
         .name = name,
         .root_module = shader_mod,
-        .use_llvm = false,
-        .use_lld = false,
+        .use_llvm = true,
+        // .use_lld = false,
     });
 
     script_obj.entry = .disabled;

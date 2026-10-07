@@ -556,11 +556,11 @@ test Gpu {
         1024,
         .r12x4_unorm_pack16,
         .{
-            .transfer_dst_bit = true,
-            .sampled_bit = true,
-            .color_attachment_bit = true,
+            .transfer_dst = true,
+            .sampled = true,
+            .color_attachment = true,
         },
-        .{ .device_local_bit = true },
+        .{ .device_local = true },
     );
 
     try testing.expectEqual(Image{ .generation = 0, .storage_index = 0 }, image_0);
