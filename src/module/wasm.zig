@@ -3833,6 +3833,8 @@ pub const __LDBL_MIN__ = @as(c_longdouble, 3.36210314311209350626e-4932);
 pub const __FLT_EVAL_METHOD__ = @as(c_int, 0);
 pub const __FLT_RADIX__ = @as(c_int, 2);
 pub const __DECIMAL_DIG__ = __LDBL_DECIMAL_DIG__;
+pub const WASM_API_EXTERN = "";
+pub const WASI_API_EXTERN = "";
 pub const __GLIBC_MINOR__ = @as(c_int, 43);
 pub const WASM_H = "";
 pub const __STDC_VERSION_STDDEF_H__ = @as(c_long, 202311);
@@ -4290,7 +4292,6 @@ pub const __ASSERT_FUNCTION = @compileError("unable to translate C expr: unexpec
 // /usr/include/assert.h:192:12
 pub const static_assert = @compileError("unable to translate C expr: unexpected token '_Static_assert'");
 // /usr/include/assert.h:210:10
-pub const WASM_API_EXTERN = "";
 pub const WASM_DECLARE_OWN = @compileError("unable to translate macro: undefined identifier `wasm_`");
 // zig-pkg/N-V-__8AAIYrdgZbtNWh99VCphRnmvPZ4iOlnho3UCE32C-d/include/wasm.h:74:9
 pub const WASM_DECLARE_VEC = @compileError("unable to translate macro: undefined identifier `wasm_`");
@@ -4351,7 +4352,6 @@ pub const WASMTIME_FEATURE_COMPONENT_MODEL = "";
 pub const WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC = "";
 pub const WASMTIME_FEATURE_PULLEY = "";
 pub const WASMTIME_FEATURE_COMPILER = "";
-pub const WASI_API_EXTERN = "";
 pub const WASI_DECLARE_OWN = @compileError("unable to translate macro: undefined identifier `wasi_`");
 // zig-pkg/N-V-__8AAIYrdgZbtNWh99VCphRnmvPZ4iOlnho3UCE32C-d/include/wasi.h:30:9
 pub const WASMTIME_API_H = "";

@@ -62,6 +62,9 @@ pub fn build(b: *Build) !void {
         .optimize = optimize,
     });
 
+    t.defineCMacro("WASM_API_EXTERN", "");
+    t.defineCMacro("WASI_API_EXTERN", "");
+
     t.addIncludePath(wasmtime_include);
 
     const wasmtime_bindings = t.output_file;
@@ -114,7 +117,7 @@ pub fn build(b: *Build) !void {
     kiwi_mod.linkLibrary(glfw_lib);
     kiwi_mod.linkLibrary(vma_lib);
     kiwi_mod.addLibraryPath(wasmtime_lib_path);
-    kiwi_mod.linkSystemLibrary("wasmtime", .{});
+    kiwi_mod.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static });
     kiwi_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
     kiwi_mod.addImport("helpers", translate_c_dep.module("helpers"));
 
@@ -138,8 +141,6 @@ pub fn build(b: *Build) !void {
     driver_mod.addOptions("static_config", static_config);
     driver_mod.linkLibrary(glfw_lib);
     driver_mod.linkLibrary(vma_lib);
-    driver_mod.addLibraryPath(wasmtime_lib_path);
-    driver_mod.linkSystemLibrary("wasmtime", .{});
     driver_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
     driver_mod.addImport("helpers", translate_c_dep.module("helpers"));
 
@@ -152,10 +153,6 @@ pub fn build(b: *Build) !void {
 
     check_step.dependOn(&driver_exe.step);
     test_step.dependOn(&driver_exe.step);
-
-    if (is_windows) {
-        driver_exe.step.dependOn(&b.addInstallBinFile(wasmtime_lib_path.path(b, "wasmtime.dll"), "wasmtime.dll").step);
-    }
 
     b.installArtifact(driver_exe);
 
@@ -170,17 +167,37 @@ pub fn build(b: *Build) !void {
         .link_libc = true,
         .link_libcpp = true,
     });
-    memswap_poc_mod.addLibraryPath(wasmtime_lib_path);
-    memswap_poc_mod.linkSystemLibrary("wasmtime", .{});
+
     memswap_poc_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
     memswap_poc_mod.addImport("helpers", translate_c_dep.module("helpers"));
-    const memswap_poc_test = b.addTest(.{ .root_module = memswap_poc_mod });
 
-    if (is_windows) {
-        memswap_poc_test.step.dependOn(&b.addInstallBinFile(wasmtime_lib_path.path(b, "wasmtime.dll"), "wasmtime.dll").step);
-    }
+    const memswap_guest_src_write = b.addWriteFiles();
+    const memswap_guest_src = memswap_guest_src_write.add("memswap_poc_guest.zig", memswap_poc.guest_src);
+    const memswap_guest_wasm = addZigScript(b, "memswap_poc_guest", memswap_guest_src);
+    memswap_poc_mod.addAnonymousImport("guest.wasm", .{ .root_source_file = memswap_guest_wasm });
+
+    const memswap_poc_test = b.addTest(.{
+        .root_module = memswap_poc_mod,
+        // NOTE: there is a bug on linux where static linking wasmtime fails under self hosted
+        .use_lld = true,
+        .use_llvm = true,
+    });
 
     const memswap_poc_test_run = b.addRunArtifact(memswap_poc_test);
+
+    memswap_poc_mod.addLibraryPath(wasmtime_lib_path);
+    memswap_poc_mod.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static });
+    if (is_windows) {
+        const win_deps: []const []const u8 = &.{ "ws2_32", "advapi32", "userenv", "ntdll", "shell32", "ole32", "bcrypt" };
+        for (win_deps) |win_dep| {
+            memswap_poc_mod.linkSystemLibrary(win_dep, .{});
+        }
+    } else {
+        const nix_deps: []const []const u8 = &.{ "m", "dl", "pthread" };
+        for (nix_deps) |nix_dep| {
+            memswap_poc_mod.linkSystemLibrary(nix_dep, .{});
+        }
+    }
 
     check_step.dependOn(&memswap_poc_test.step);
     test_step.dependOn(&memswap_poc_test_run.step);
@@ -541,6 +558,7 @@ fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vu
     return lib;
 }
 
+const memswap_poc = @import("src/memswap-poc.zig");
 const Translator = @import("translate_c").Translator;
 const base = @import("src/module/base.zig");
 const zon = base.zon;

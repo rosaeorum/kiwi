@@ -1,212 +1,79 @@
-//! # Memory Swap Architecture & Host-Guest Contract
-//!
-//! ## Memory Layout
-//!
-//! Every module receives a full 4GB virtual address space for its linear memory.
-//! The swap zone is pinned to the final 64KB of this region. Guests compile against
-//! the swap zone as a plain variable without requiring specific placement
-//! directives (stack, globals, data, and heap grow naturally from address `0`).
-//!
-//! | Range | Description |
-//! | :--- | :--- |
-//! | `[0x0, 0xFFFF0000)` | Guest memory (grows dynamically via `memory.grow`) |
-//! | `[0xFFFF0000, 0x100000000)` | Swap zone (fixed 64KB, remapped per-blob by the host) |
-//! | `[0x100000000, +guard)` | Guard region (never mapped, catches faults) |
-//!
-//! ## Bounds Checking & JIT Elision
-//!
-//! This architecture relies on specific Wasmtime bounds-checking behavior:
-//! > Wasmtime 50, memory32, no max, 64-bit host, default "tunables":
-//! > reservation 4GB, guard 32MiB, `signals_based_traps` enabled
-//!
-//! 1. **Static Offsets:** Accesses with a static offset + size below ~32MiB emit **no bounds checks**.
-//! 2. **Dynamic Offsets:** Accesses up to 4GB emit a single comparison of the index
-//!    against the 4GB reservation (a compile-time constant), never against `memory.size`.
-//! 3. **Fault-Based Traps:** Enforcement of `[size, reservation)` is handled by hardware faults.
-//!    The trap handler classifies the faulting PC and trap metadata into a Wasm Out-Of-Bounds (OOB) trap.
-//!
-//! ### The Wasmtime Creator Contract Deviation
-//! Wasmtime's `MemoryCreator` contract assumes the host will reserve
-//! `reserved_size_in_bytes` plus the guard, leaving uncommitted memory
-//! inaccessible. The JIT elides bounds checks based on this assumption.
-//!
-//! We deliberately violate this assumption: we map the last 64KB of the
-//! reservation. Consequently, swap zone accesses that *should* trap based on
-//! `memory.size` instead succeed. This forms the static ABI.
-//!
-//! ## Static ABI Requirements
-//!
-//! * **Dynamic Linear Memory:** The guest linear memory must be dynamic. Declaring
-//!   `min == max` forces the JIT to bounds-check against the static size, making
-//!   the swap zone unreachable.
-//! * **Zone Addressing:** Guest code reaches the zone pointer-style (address in
-//!   index register, tiny static offsets). Because the JIT elides size checks, the
-//!   zone is reachable from the first instruction regardless of `memory.size`.
-//! * **Growth Limits:** Growing into the swap zone is rejected as a spec-conformant
-//!   `memory.grow` failure.
-//!
-//! ## Backing Storage & Out-of-Band (OOB) Access
-//!
-//! Both Linux and Windows platforms back the guest region with lazy storage (Linux:
-//! `memfd`; Windows: sparse temp file). Guest pages are identity-mapped into this
-//! storage (guest byte offset == backing-store offset).
-//!
-//! * **Coherent OOB Access:** The host retains out-of-band read/write access to
-//!   live guest memory without traversing the guest's virtual address space.
-//! * **Resilience:** The backing-store channel remains available even if the guest
-//!   mapping is temporarily torn down. This is the mechanism used for inter-process
-//!   handoffs, snapshot routines, and core dumpers.
-//!
-//! ## Zone Parking & Safety
-//!
-//! * **Default Parked State:** The swap zone is parked by default (`PROT_NONE` or
-//!   placeholder). Parking between operations costs nothing because `blobSwapIn` is
-//!   a page-table edit.
-//! * **Trap Enforcement:** A buggy or malicious guest touching the zone outside a
-//!   deliberate swap window triggers a spec-conformant OOB trap rather than
-//!   silently reading stale data.
-//! * **Host Restrictions:** While parked, the host must not access the zone through
-//!   `base + ZONE_OFF`, as this causes a standard host segfault (the PC is
-//!   unrecognized by `lookup_code`). OOB channels (`pread` / scratch views) remain
-//!   safe.
-//! * **Hardware Traps Required:** This design strictly requires
-//!   `signals_based_traps(true)`. Interpreters (like Pulley) or backends that
-//!   reintroduce explicit checks (like Winch) will silently fail to reach the zone.
-//!
-//! ## Upstream Compatibility
-//!
-//! Custom linear memories in Wasmtime officially exist to customize allocation
-//! while enforcing WebAssembly semantics. Our architecture intentionally deviates
-//! by allowing mapped-beyond-size accesses to succeed.
-//!
-//! Because this creates a tightly coupled host/guest pair, upstream changes to the
-//! `MemoryCreator` contract will not account for this use case. The
-//! runtime-observable trap probes in the test suite serve as the
-//! contract enforcement against Wasmtime regressions.
-
 const memswap_proof_of_concept = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("module/wasm.zig");
 
+const guest_wasm: []const u8 = @embedFile("guest.wasm");
+
 const log_errs = !@import("builtin").is_test;
 
 const log = std.log.scoped(.wasm);
 
-const WASM_PAGE: usize = 64 * 1024;
-const GUEST_SPAN: usize = 1 << 32; // 4gb per module
-const SWAP_ZONE: usize = WASM_PAGE; // swap zone size
-const ZONE_OFF: usize = GUEST_SPAN - SWAP_ZONE; // 0xFFFF0000 for the static ABI
-const GUEST_LIMIT: usize = ZONE_OFF; // largest size memory.grow may reach
+const wasm_page_size: usize = 64 * 1024;
+const wasm_region_size: usize = 1 << 32;
+const swap_zone_size: usize = wasm_page_size * 16;
+const swap_zone_base_offset: usize = wasm_region_size - swap_zone_size;
+
+pub const guest_src: []const u8 =
+    std.fmt.comptimePrint(
+        \\const std = @import("std");
+        \\pub const ZONE_ADDR: usize = 0x{x};
+        \\pub const ZONE_LEN: usize = 0x{x};
+    , .{ swap_zone_base_offset, swap_zone_size }) ++
+    \\pub const BlobHead = extern struct { lhs: i32, rhs: i32 };
+    \\const zone: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
+    // stand-in for an ecs system, operates on swapped zone data
+    \\export fn add() void {
+    \\    zone.lhs = zone.lhs + zone.rhs;
+    \\}
+    // read an i32 from anywhere in guest memory
+    // the host uses this to verify its out-of-band writes through the identity backing are guest-visible
+    \\export fn echo(addr: u32) i32 {
+    \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
+    \\    return p.*;
+    \\}
+    // write an i32 anywhere in guest memory
+    // the host verifies it out-of-band
+    \\export fn poke(addr: u32, val: i32) void {
+    \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
+    \\    p.* = val;
+    \\}
+    // grow linear memory by `pages` pages;
+    // 0 on success, -1 (per wasm spec) if the host refuses; e.g. growing into the swap zone
+    \\export fn grow(pages: u32) i32 {
+    \\    if (@wasmMemoryGrow(0, pages) != -1) return 0;
+    \\    return -1;
+    \\}
+    // tests guest's own data section
+    \\export var scratch: [3]i32 = .{ 0, 0, 0 };
+    \\export fn scratchAddr(idx: u32) u32 {
+    \\    return @intCast(@intFromPtr(&scratch[idx]));
+    \\}
+    // zone reachability via BOTH addressing forms, so a wasmtime config or
+    // regression that reintroduces current-size bounds checks fails the suite
+    \\export fn zoneLhsStatic() i32 { // folds to: i32.load offset=0xFFFF0000
+    \\    const h: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
+    \\    return h.lhs;
+    \\}
+    // test runtime pointer in the index register
+    \\export fn zonePokeDynamic(base: u32, val: i32) void {
+    \\    const h: *align(1) BlobHead = @ptrFromInt(@as(usize, base));
+    \\    h.lhs = val;
+    \\}
+    // returns memory.size exactly as the JIT sees it
+    \\export fn memPages() u32 {
+    \\    return @wasmMemorySize(0);
+    \\}
+    ;
 
 fn i32At(base: [*]u8, off: usize) *align(1) i32 {
     return @ptrCast(base + off);
 }
 
-// typed view of SWAP_ZONE; mirrors `BlobHead` in guest.zig
 const BlobHead = extern struct { lhs: i32, rhs: i32 };
 
 const Platform = switch (builtin.os.tag) {
-    .linux => struct {
-        const PROT_NONE: c_int = 0x0;
-        const PROT_READ: c_int = 0x1;
-        const PROT_WRITE: c_int = 0x2;
-        const MAP_SHARED: c_int = 0x01;
-        const MAP_PRIVATE: c_int = 0x02;
-        const MAP_FIXED: c_int = 0x10;
-        const MAP_ANONYMOUS: c_int = 0x20;
-        const MAP_NORESERVE: c_int = 0x4000;
-
-        extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
-        extern "c" fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
-        extern "c" fn ftruncate(fd: c_int, len: i64) c_int;
-        extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, off: i64) isize;
-        extern "c" fn pwrite(fd: c_int, buf: [*]const u8, count: usize, off: i64) isize;
-        extern "c" fn close(fd: c_int) c_int;
-
-        fn mmapOk(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque {
-            const p = mmap(addr, len, prot, flags, fd, off) orelse return null;
-            if (@intFromPtr(p) == std.math.maxInt(usize)) return null;
-            return p;
-        }
-
-        pub const State = struct { fd: c_int = -1 };
-
-        pub fn init() void {}
-
-        pub fn reserveSpan(st: *State, span: usize) ?[*]u8 {
-            const base = mmapOk(null, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return null;
-            const fd = memfd_create("wzs-guest", 0);
-            if (fd < 0) return null;
-            if (ftruncate(fd, @intCast(GUEST_LIMIT)) != 0) {
-                _ = close(fd);
-                return null;
-            }
-            st.* = .{ .fd = fd };
-            return @ptrCast(base);
-        }
-
-        pub fn commitGuestPages(st: *State, at: [*]u8, guest_off: usize, len: usize) bool {
-            return mmapOk(@ptrCast(at), len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, st.fd, @intCast(guest_off)) != null;
-        }
-
-        pub fn commitSwapZone(st: *State, zone: [*]u8, len: usize) bool {
-            _ = st;
-            return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
-        }
-
-        pub const Blob = struct { fd: c_int, len: usize };
-
-        pub fn blobCreate(len: usize, head: ?BlobHead) ?Blob {
-            const fd = memfd_create("wzs-blob", 0);
-            if (fd < 0) return null;
-            if (ftruncate(fd, @intCast(len)) != 0) {
-                _ = close(fd);
-                return null;
-            }
-            if (head) |h| {
-                if (pwrite(fd, @ptrCast(&h), @sizeOf(BlobHead), 0) != @sizeOf(BlobHead)) {
-                    _ = close(fd);
-                    return null;
-                }
-            }
-            return .{ .fd = fd, .len = len };
-        }
-
-        pub fn blobSwapIn(zone: [*]u8, blob: Blob) bool {
-            return mmapOk(@ptrCast(zone), blob.len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, blob.fd, 0) != null;
-        }
-
-        pub fn blobReadHead(blob: Blob) BlobHead {
-            var h: BlobHead = undefined;
-            if (pread(blob.fd, @ptrCast(&h), @sizeOf(BlobHead), 0) != @sizeOf(BlobHead)) fatal("pread", .{});
-            return h;
-        }
-
-        pub fn blobClose(blob: Blob) void {
-            _ = close(blob.fd);
-        }
-
-        pub fn guestPeek32(st: *State, guest_off: usize) i32 {
-            var v: i32 = undefined;
-            if (pread(st.fd, @ptrCast(&v), 4, @intCast(guest_off)) != 4) fatal("pread guest", .{});
-            return v;
-        }
-
-        pub fn guestPoke32(st: *State, guest_off: usize, val: i32) void {
-            if (pwrite(st.fd, @ptrCast(&val), 4, @intCast(guest_off)) != 4) fatal("pwrite guest", .{});
-        }
-
-        pub fn zonePark(zone: [*]u8, len: usize) bool {
-            return mmapOk(@ptrCast(zone), len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
-        }
-
-        pub fn zoneUnpark(zone: [*]u8, len: usize) bool {
-            return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
-        }
-    },
-
     .windows => struct {
         const HANDLE = ?*anyopaque;
         const BOOL = i32;
@@ -300,8 +167,8 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn reserveSpan(st: *State, span: usize) ?[*]u8 {
-            st.guest_section = makeFileSection(GUEST_LIMIT) orelse return null;
-            st.zero_section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, 0, @truncate(SWAP_ZONE), null);
+            st.guest_section = makeFileSection(swap_zone_base_offset) orelse return null;
+            st.zero_section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, 0, @truncate(swap_zone_size), null);
             if (st.zero_section == null) {
                 _ = CloseHandle(st.guest_section.?);
                 st.* = .{};
@@ -368,9 +235,8 @@ const Platform = switch (builtin.os.tag) {
         }
 
         fn guestAccess(st: *State, guest_off: usize, write: bool, val: i32) i32 {
-            std.debug.assert(guest_off + 4 <= GUEST_LIMIT);
-            const gran: usize = 64 * 1024;
-            const map_off = guest_off & ~(gran - 1);
+            std.debug.assert(guest_off + 4 <= swap_zone_base_offset);
+            const map_off = guest_off & ~(wasm_page_size - 1);
             const v = MapViewOfFile(st.guest_section, FILE_MAP_ALL_ACCESS, @truncate(map_off >> 32), @truncate(map_off), (guest_off + 4) - map_off) orelse fatal("MapViewOfFile scratch", .{});
             defer _ = UnmapViewOfFile(v);
             const view: [*]u8 = @ptrCast(v);
@@ -400,7 +266,104 @@ const Platform = switch (builtin.os.tag) {
         }
     },
 
-    else => @compileError("platform nyi"),
+    else => struct {
+        const PROT_NONE: c_int = 0x0;
+        const PROT_READ: c_int = 0x1;
+        const PROT_WRITE: c_int = 0x2;
+        const MAP_SHARED: c_int = 0x01;
+        const MAP_PRIVATE: c_int = 0x02;
+        const MAP_FIXED: c_int = 0x10;
+        const MAP_ANONYMOUS: c_int = 0x20;
+        const MAP_NORESERVE: c_int = 0x4000;
+
+        extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
+        extern "c" fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
+        extern "c" fn ftruncate(fd: c_int, len: i64) c_int;
+        extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, off: i64) isize;
+        extern "c" fn pwrite(fd: c_int, buf: [*]const u8, count: usize, off: i64) isize;
+        extern "c" fn close(fd: c_int) c_int;
+
+        fn mmapOk(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque {
+            const p = mmap(addr, len, prot, flags, fd, off) orelse return null;
+            if (@intFromPtr(p) == std.math.maxInt(usize)) return null;
+            return p;
+        }
+
+        pub const State = struct { fd: c_int = -1 };
+
+        pub fn init() void {}
+
+        pub fn reserveSpan(st: *State, span: usize) ?[*]u8 {
+            const base = mmapOk(null, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return null;
+            const fd = memfd_create("wzs-guest", 0);
+            if (fd < 0) return null;
+            if (ftruncate(fd, @intCast(swap_zone_base_offset)) != 0) {
+                _ = close(fd);
+                return null;
+            }
+            st.* = .{ .fd = fd };
+            return @ptrCast(base);
+        }
+
+        pub fn commitGuestPages(st: *State, at: [*]u8, guest_off: usize, len: usize) bool {
+            return mmapOk(@ptrCast(at), len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, st.fd, @intCast(guest_off)) != null;
+        }
+
+        pub fn commitSwapZone(st: *State, zone: [*]u8, len: usize) bool {
+            _ = st;
+            return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+        }
+
+        pub const Blob = struct { fd: c_int, len: usize };
+
+        pub fn blobCreate(len: usize, head: ?BlobHead) ?Blob {
+            const fd = memfd_create("wzs-blob", 0);
+            if (fd < 0) return null;
+            if (ftruncate(fd, @intCast(len)) != 0) {
+                _ = close(fd);
+                return null;
+            }
+            if (head) |h| {
+                if (pwrite(fd, @ptrCast(&h), @sizeOf(BlobHead), 0) != @sizeOf(BlobHead)) {
+                    _ = close(fd);
+                    return null;
+                }
+            }
+            return .{ .fd = fd, .len = len };
+        }
+
+        pub fn blobSwapIn(zone: [*]u8, blob: Blob) bool {
+            return mmapOk(@ptrCast(zone), blob.len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, blob.fd, 0) != null;
+        }
+
+        pub fn blobReadHead(blob: Blob) BlobHead {
+            var h: BlobHead = undefined;
+            if (pread(blob.fd, @ptrCast(&h), @sizeOf(BlobHead), 0) != @sizeOf(BlobHead)) fatal("pread", .{});
+            return h;
+        }
+
+        pub fn blobClose(blob: Blob) void {
+            _ = close(blob.fd);
+        }
+
+        pub fn guestPeek32(st: *State, guest_off: usize) i32 {
+            var v: i32 = undefined;
+            if (pread(st.fd, @ptrCast(&v), 4, @intCast(guest_off)) != 4) fatal("pread guest", .{});
+            return v;
+        }
+
+        pub fn guestPoke32(st: *State, guest_off: usize, val: i32) void {
+            if (pwrite(st.fd, @ptrCast(&val), 4, @intCast(guest_off)) != 4) fatal("pwrite guest", .{});
+        }
+
+        pub fn zonePark(zone: [*]u8, len: usize) bool {
+            return mmapOk(@ptrCast(zone), len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+        }
+
+        pub fn zoneUnpark(_: *State, zone: [*]u8, len: usize) bool {
+            return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+        }
+    },
 };
 
 const HostMem = struct {
@@ -446,14 +409,14 @@ fn hostNewMemory(
         return c.wasmtime_error_new("host memory: MVP is wired for exactly one memory");
     const m: *HostMem = @ptrCast(@alignCast(env.?));
 
-    const reservation: usize = if (reserved_size_in_bytes != 0) reserved_size_in_bytes else GUEST_SPAN;
+    const reservation: usize = if (reserved_size_in_bytes != 0) reserved_size_in_bytes else wasm_region_size;
     const guard: usize = guard_size_in_bytes;
 
-    if (reservation < GUEST_SPAN)
+    if (reservation < wasm_region_size)
         return c.wasmtime_error_new("host memory: reservation below 4gb; the fixed swap-zone ABI requires the full 4gb (check wasmtime memory_reservation config)");
-    if (reservation + guard <= GUEST_SPAN)
+    if (reservation + guard <= wasm_region_size)
         return c.wasmtime_error_new("host memory: reservation+guard not above 4gb; bounds-check elision is off and the swap zone would be unreachable (check memory_reservation/memory_guard_size config)");
-    if (minimum > GUEST_LIMIT)
+    if (minimum > swap_zone_base_offset)
         return c.wasmtime_error_new("host memory: module memory larger than the guest region below the swap zone");
     const no_max = maximum == std.math.maxInt(usize);
     if (!no_max and maximum == minimum)
@@ -469,12 +432,12 @@ fn hostNewMemory(
         return c.wasmtime_error_new("host memory: span reservation failed");
     if (!Platform.commitGuestPages(&m.plat, base, 0, minimum))
         return c.wasmtime_error_new("host memory: guest pages commit failed");
-    if (!Platform.commitSwapZone(&m.plat, base + ZONE_OFF, SWAP_ZONE))
+    if (!Platform.commitSwapZone(&m.plat, base + swap_zone_base_offset, swap_zone_size))
         return c.wasmtime_error_new("host memory: swap zone commit failed");
 
     m.base = base;
     m.size = minimum;
-    m.capacity = GUEST_LIMIT;
+    m.capacity = swap_zone_base_offset;
     m.guard = guard;
 
     memory_ret.* = .{
@@ -575,93 +538,12 @@ fn expectTrap(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32) !void {
     return error.ExpectedTrap;
 }
 
+pub const std_options = std.Options{
+    .log_level = .debug,
+};
+
 test {
     Platform.init();
-
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-out");
-
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = "zig-out/memswap-poc-guest.zig",
-        .data =
-        \\const std = @import("std");
-        \\pub const ZONE_ADDR: usize = 0xFFFF_0000;
-        \\pub const ZONE_LEN: usize = 64 * 1024;
-        \\pub const BlobHead = extern struct { lhs: i32, rhs: i32 };
-        \\const zone: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
-        // stand-in for an ecs system, operates on swapped zone data
-        \\export fn add() void {
-        \\    zone.lhs = zone.lhs + zone.rhs;
-        \\}
-        // read an i32 from anywhere in guest memory
-        // the host uses this to verify its out-of-band writes through the identity backing are guest-visible
-        \\export fn echo(addr: u32) i32 {
-        \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
-        \\    return p.*;
-        \\}
-        // write an i32 anywhere in guest memory
-        // the host verifies it out-of-band
-        \\export fn poke(addr: u32, val: i32) void {
-        \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
-        \\    p.* = val;
-        \\}
-        // grow linear memory by `pages` pages;
-        // 0 on success, -1 (per wasm spec) if the host refuses; e.g. growing into the swap zone
-        \\export fn grow(pages: u32) i32 {
-        \\    if (@wasmMemoryGrow(0, pages) != -1) return 0;
-        \\    return -1;
-        \\}
-        // tests guest's own data section
-        \\export var scratch: [3]i32 = .{ 0, 0, 0 };
-        \\export fn scratchAddr(idx: u32) u32 {
-        \\    return @intCast(@intFromPtr(&scratch[idx]));
-        \\}
-        // zone reachability via BOTH addressing forms, so a wasmtime config or
-        // regression that reintroduces current-size bounds checks fails the suite
-        \\export fn zoneLhsStatic() i32 { // folds to: i32.load offset=0xFFFF0000
-        \\    const h: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
-        \\    return h.lhs;
-        \\}
-        // test runtime pointer in the index register
-        \\export fn zonePokeDynamic(base: u32, val: i32) void {
-        \\    const h: *align(1) BlobHead = @ptrFromInt(@as(usize, base));
-        \\    h.lhs = val;
-        \\}
-        // returns memory.size exactly as the JIT sees it
-        \\export fn memPages() u32 {
-        \\    return @wasmMemorySize(0);
-        \\}
-        ,
-    });
-    defer {
-        std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/memswap-poc-guest.zig") catch |err| {
-            log.warn("failed to delete test file: {s}", .{@errorName(err)});
-        };
-    }
-
-    var zig = try std.process.spawn(std.testing.io, .{
-        .argv = &.{
-            // zig fmt: off
-            "zig", "build-exe",
-            "zig-out/memswap-poc-guest.zig",
-            "-target", "wasm32-freestanding",
-            "-O", "fast",
-            "-fno-llvm", "-fno-lld",
-            "-fno-entry", "-rdynamic",
-            "-femit-bin=zig-out/memswap-poc-guest.wasm",
-            // zig fmt: on
-        },
-    });
-
-    const term = try zig.wait(std.testing.io);
-    if (!term.success()) return error.FailedToCompileWasm;
-
-    const guest_wasm = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-out/memswap-poc-guest.wasm", std.testing.allocator, .unlimited);
-    defer std.testing.allocator.free(guest_wasm);
-    defer {
-        std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/memswap-poc-guest.wasm") catch |err| {
-            log.warn("failed to delete test file: {s}", .{@errorName(err)});
-        };
-    }
 
     const config = c.wasm_config_new() orelse return error.ConfigNewFailed;
     c.wasmtime_config_host_memory_creator_set(config, &memory_creator);
@@ -698,7 +580,7 @@ test {
     const st = &host_mem.plat;
 
     log.debug("guest memory: base=0x{x} size={d} capacity={d} guard={d}", .{ @intFromPtr(base), host_mem.size, host_mem.capacity, host_mem.guard });
-    log.debug("swap zone: [0x{x}, 0x{x}) - fixed offset in every module", .{ ZONE_OFF, GUEST_SPAN });
+    log.debug("swap zone: [0x{x}, 0x{x}) - fixed offset in every module", .{ swap_zone_base_offset, wasm_region_size });
 
     {
         var item: c.wasmtime_extern_t = undefined;
@@ -727,7 +609,7 @@ test {
     const size_before = host_mem.size;
     const grow_addr: i32 = @intCast(size_before + 0x40);
     if (try call1ret(ctx, f_grow, 2) != 0) return error.GrowFailed;
-    if (host_mem.size != size_before + 2 * WASM_PAGE) return error.GrowSizeWrong;
+    if (host_mem.size != size_before + 2 * wasm_page_size) return error.GrowSizeWrong;
     Platform.guestPoke32(st, @intCast(grow_addr), 0x5151);
     if (try call1ret(ctx, f_echo, grow_addr) != 0x5151) return error.GrowCommitInvisible;
     log.debug("[grow] +2 pages -> size={d}; fresh pages are identity-backed and both channels agree", .{host_mem.size});
@@ -735,24 +617,24 @@ test {
     if (try call1ret(ctx, f_grow, 0x10000) != -1) return error.GrowShouldHaveFailed;
     log.debug("[grow] refused to grow past the zone (returned -1, no trap)", .{});
 
-    const blob_a = Platform.blobCreate(SWAP_ZONE, .{ .lhs = 10, .rhs = 32 }) orelse fatal("blobCreate(A)", .{});
-    const blob_b = Platform.blobCreate(SWAP_ZONE, .{ .lhs = 7, .rhs = 5 }) orelse fatal("blobCreate(B)", .{});
+    const blob_a = Platform.blobCreate(swap_zone_size, .{ .lhs = 10, .rhs = 32 }) orelse fatal("blobCreate(A)", .{});
+    const blob_b = Platform.blobCreate(swap_zone_size, .{ .lhs = 7, .rhs = 5 }) orelse fatal("blobCreate(B)", .{});
     defer Platform.blobClose(blob_a);
     defer Platform.blobClose(blob_b);
 
-    if (!Platform.blobSwapIn(base + ZONE_OFF, blob_a)) fatal("blobSwapIn(A)", .{});
+    if (!Platform.blobSwapIn(base + swap_zone_base_offset, blob_a)) fatal("blobSwapIn(A)", .{});
     try call0(ctx, f_add);
     {
-        const via_va = i32At(base, ZONE_OFF).*;
+        const via_va = i32At(base, swap_zone_base_offset).*;
         const via_fd = Platform.blobReadHead(blob_a);
         log.debug("[A] {{10,32}} in -> add() -> zone[0]={d} (host VA); blob A via fd: {{{d}, {d}}}", .{ via_va, via_fd.lhs, via_fd.rhs });
         if (via_va != 42 or via_fd.lhs != 42 or via_fd.rhs != 32) return error.RoundtripAFailed;
     }
 
-    if (!Platform.blobSwapIn(base + ZONE_OFF, blob_b)) fatal("blobSwapIn(B)", .{});
+    if (!Platform.blobSwapIn(base + swap_zone_base_offset, blob_b)) fatal("blobSwapIn(B)", .{});
     try call0(ctx, f_add);
     {
-        const via_va = i32At(base, ZONE_OFF).*;
+        const via_va = i32At(base, swap_zone_base_offset).*;
         const via_fd = Platform.blobReadHead(blob_b);
         log.debug("[B] {{7,5}} in   -> add() -> zone[0]={d} (host VA); blob B via fd: {{{d}, {d}}}", .{ via_va, via_fd.lhs, via_fd.rhs });
         if (via_va != 12 or via_fd.lhs != 12 or via_fd.rhs != 5) return error.RoundtripBFailed;
@@ -769,10 +651,10 @@ test {
 
     try expectTrap(ctx, f_echo, @intCast(host_mem.size + 0x1000));
     try expectTrap(ctx, f_echo, 0x7FFF_FFFC);
-    try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(ZONE_OFF - 4))));
+    try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(swap_zone_base_offset - 4))));
 
-    if (!Platform.zonePark(base + ZONE_OFF, SWAP_ZONE)) return error.ZoneParkFailed;
-    try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(ZONE_OFF))));
+    if (!Platform.zonePark(base + swap_zone_base_offset, swap_zone_size)) return error.ZoneParkFailed;
+    try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(swap_zone_base_offset))));
     {
         var trapped = false;
         _ = call0(ctx, f_add) catch {
@@ -781,18 +663,18 @@ test {
         if (!trapped) return error.ParkedZoneDidNotTrap;
     }
 
-    if (!Platform.zoneUnpark(base + ZONE_OFF, SWAP_ZONE)) return error.ZoneUnparkFailed;
+    if (!Platform.zoneUnpark(st, base + swap_zone_base_offset, swap_zone_size)) return error.ZoneUnparkFailed;
 
-    if (try call0ret(ctx, f_memPages) != host_mem.size / WASM_PAGE) return error.MemSizeMismatch;
+    if (try call0ret(ctx, f_memPages) != host_mem.size / wasm_page_size) return error.MemSizeMismatch;
 
-    const blob_test = Platform.blobCreate(SWAP_ZONE, .{ .lhs = 100, .rhs = 200 }) orelse fatal("blobCreate(test)", .{});
+    const blob_test = Platform.blobCreate(swap_zone_size, .{ .lhs = 100, .rhs = 200 }) orelse fatal("blobCreate(test)", .{});
     defer Platform.blobClose(blob_test);
-    if (!Platform.blobSwapIn(base + ZONE_OFF, blob_test)) fatal("blobSwapIn(test)", .{});
+    if (!Platform.blobSwapIn(base + swap_zone_base_offset, blob_test)) fatal("blobSwapIn(test)", .{});
 
     const static_val = try call0ret(ctx, f_zoneLhsStatic);
     if (static_val != 100) return error.ZoneStaticReadFailed;
 
-    try call2(ctx, f_zonePokeDynamic, @bitCast(@as(u32, @intCast(ZONE_OFF))), 999);
+    try call2(ctx, f_zonePokeDynamic, @bitCast(@as(u32, @intCast(swap_zone_base_offset))), 999);
 
     const test_head = Platform.blobReadHead(blob_test);
     if (test_head.lhs != 999) return error.ZoneDynamicWriteFailed;
