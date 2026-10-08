@@ -21,11 +21,17 @@ pub const guest_src: []const u8 =
         \\pub const ZONE_ADDR: usize = 0x{x};
         \\pub const ZONE_LEN: usize = 0x{x};
     , .{ swap_zone_base_offset, swap_zone_size }) ++
-    \\pub const BlobHead = extern struct { lhs: i32, rhs: i32 };
-    \\const zone: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
-    // stand-in for an ecs system, operates on swapped zone data
+    // the host swap zone, as the guest sees it: one fixed []u8 window
+    \\pub fn zoneBytes() []u8 {
+    \\    const p: [*]u8 = @ptrFromInt(ZONE_ADDR);
+    \\    return p[0..ZONE_LEN];
+    \\}
+    // stand-in for an ecs system, operates on swapped zone data as bytes
     \\export fn add() void {
-    \\    zone.lhs = zone.lhs + zone.rhs;
+    \\    const z = zoneBytes();
+    \\    const lhs = std.mem.readInt(i32, z[0..4], .little);
+    \\    const rhs = std.mem.readInt(i32, z[4..8], .little);
+    \\    std.mem.writeInt(i32, z[0..4], lhs + rhs, .little);
     \\}
     // read an i32 from anywhere in guest memory
     // the host uses this to verify its out-of-band writes through the identity backing are guest-visible
@@ -52,14 +58,14 @@ pub const guest_src: []const u8 =
     \\}
     // zone reachability via BOTH addressing forms, so a wasmtime config or
     // regression that reintroduces current-size bounds checks fails the suite
-    \\export fn zoneLhsStatic() i32 { // folds to: i32.load offset=0xFFFF0000
-    \\    const h: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
-    \\    return h.lhs;
+    \\export fn zoneLoadStatic() i32 { // folds to: i32.load offset=0xFFFF0000
+    \\    const p: *align(1) i32 = @ptrFromInt(ZONE_ADDR);
+    \\    return p.*;
     \\}
     // test runtime pointer in the index register
     \\export fn zonePokeDynamic(base: u32, val: i32) void {
-    \\    const h: *align(1) BlobHead = @ptrFromInt(@as(usize, base));
-    \\    h.lhs = val;
+    \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, base));
+    \\    p.* = val;
     \\}
     // returns memory.size exactly as the JIT sees it
     \\export fn memPages() u32 {
@@ -71,7 +77,20 @@ fn i32At(base: [*]u8, off: usize) *align(1) i32 {
     return @ptrCast(base + off);
 }
 
-const BlobHead = extern struct { lhs: i32, rhs: i32 };
+/// host alias of the swap zone inside the guest's linear-memory reservation;
+/// whatever blob is swapped in is directly reachable through this view
+fn zoneView(base: [*]u8) []u8 {
+    return (base + swap_zone_base_offset)[0..swap_zone_size];
+}
+
+/// typed access only through byte views; wasm linear memory is little-endian
+fn getI32(view: []const u8, idx: usize) i32 {
+    return std.mem.readInt(i32, view[idx * 4 ..][0..4], .little);
+}
+
+fn putI32(view: []u8, idx: usize, val: i32) void {
+    std.mem.writeInt(i32, view[idx * 4 ..][0..4], val, .little);
+}
 
 const Platform = switch (builtin.os.tag) {
     .windows => struct {
@@ -197,41 +216,36 @@ const Platform = switch (builtin.os.tag) {
             return mapSectionView(st.guest_section.?, at, guest_off, len);
         }
 
-        pub fn commitSwapZone(st: *State, zone: [*]u8, len: usize) bool {
-            if (!splitPlaceholder(zone, len)) return false;
-            return mapSectionView(st.zero_section.?, zone, 0, len);
+        pub fn commitSwapZone(st: *State, zone: []u8) bool {
+            if (!splitPlaceholder(zone.ptr, zone.len)) return false;
+            return mapSectionView(st.zero_section.?, zone.ptr, 0, zone.len);
         }
 
         pub const Blob = struct { section: HANDLE, len: usize };
 
-        pub fn blobCreate(len: usize, head: ?BlobHead) ?Blob {
+        pub fn blobCreate(len: usize) ?Blob {
             const section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, @truncate(len >> 32), @truncate(len), null) orelse return null;
-            if (head) |h| {
-                const v = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 0) orelse {
-                    _ = CloseHandle(section);
-                    return null;
-                };
-                const hv: *align(1) BlobHead = @ptrCast(v);
-                hv.* = h;
-                _ = UnmapViewOfFile(v);
-            }
             return .{ .section = section, .len = len };
         }
 
-        pub fn blobSwapIn(zone: [*]u8, blob: Blob) bool {
-            if (UnmapViewOfFileEx.?(@ptrCast(zone), MEM_PRESERVE_PLACEHOLDER) == 0) return false;
-            return mapSectionView(blob.section, zone, 0, blob.len);
-        }
-
-        pub fn blobReadHead(blob: Blob) BlobHead {
-            const v = MapViewOfFile(blob.section, FILE_MAP_READ, 0, 0, 0) orelse fatal("MapViewOfFile", .{});
-            defer _ = UnmapViewOfFile(v);
-            const hv: *align(1) BlobHead = @ptrCast(v);
-            return hv.*;
-        }
-
-        pub fn blobClose(blob: Blob) void {
+        pub fn blobDestroy(blob: Blob) void {
             _ = CloseHandle(blob.section);
+        }
+
+        pub fn blobMap(blob: Blob) ?[]u8 {
+            const v = MapViewOfFile(blob.section, FILE_MAP_ALL_ACCESS, 0, 0, 0) orelse return null;
+            const p: [*]u8 = @ptrCast(v);
+            return p[0..blob.len];
+        }
+
+        pub fn blobUnmap(view: []u8) void {
+            _ = UnmapViewOfFile(@ptrCast(view.ptr));
+        }
+
+        pub fn blobSwapIn(zone: []u8, blob: Blob) bool {
+            std.debug.assert(blob.len <= zone.len);
+            _ = UnmapViewOfFileEx.?(@ptrCast(zone.ptr), MEM_PRESERVE_PLACEHOLDER);
+            return mapSectionView(blob.section, zone.ptr, 0, blob.len);
         }
 
         fn guestAccess(st: *State, guest_off: usize, write: bool, val: i32) i32 {
@@ -256,13 +270,13 @@ const Platform = switch (builtin.os.tag) {
             _ = guestAccess(st, guest_off, true, val);
         }
 
-        pub fn zonePark(zone: [*]u8, len: usize) bool {
-            _ = len;
-            return UnmapViewOfFileEx.?(@ptrCast(zone), MEM_PRESERVE_PLACEHOLDER) != 0;
+        pub fn zonePark(zone: []u8) bool {
+            return UnmapViewOfFileEx.?(@ptrCast(zone.ptr), MEM_PRESERVE_PLACEHOLDER) != 0;
         }
 
-        pub fn zoneUnpark(st: *State, zone: [*]u8, len: usize) bool {
-            return mapSectionView(st.zero_section.?, zone, 0, len);
+        pub fn zoneUnpark(st: *State, zone: []u8) bool {
+            _ = UnmapViewOfFileEx.?(@ptrCast(zone.ptr), MEM_PRESERVE_PLACEHOLDER);
+            return mapSectionView(st.zero_section.?, zone.ptr, 0, zone.len);
         }
     },
 
@@ -277,6 +291,7 @@ const Platform = switch (builtin.os.tag) {
         const MAP_NORESERVE: c_int = 0x4000;
 
         extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
+        extern "c" fn munmap(addr: ?*anyopaque, len: usize) c_int;
         extern "c" fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
         extern "c" fn ftruncate(fd: c_int, len: i64) c_int;
         extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, off: i64) isize;
@@ -309,41 +324,42 @@ const Platform = switch (builtin.os.tag) {
             return mmapOk(@ptrCast(at), len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, st.fd, @intCast(guest_off)) != null;
         }
 
-        pub fn commitSwapZone(st: *State, zone: [*]u8, len: usize) bool {
+        pub fn commitSwapZone(st: *State, zone: []u8) bool {
             _ = st;
-            return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+            return mmapOk(@ptrCast(zone.ptr), zone.len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
 
         pub const Blob = struct { fd: c_int, len: usize };
 
-        pub fn blobCreate(len: usize, head: ?BlobHead) ?Blob {
+        pub fn blobCreate(len: usize) ?Blob {
             const fd = memfd_create("wzs-blob", 0);
             if (fd < 0) return null;
             if (ftruncate(fd, @intCast(len)) != 0) {
                 _ = close(fd);
                 return null;
             }
-            if (head) |h| {
-                if (pwrite(fd, @ptrCast(&h), @sizeOf(BlobHead), 0) != @sizeOf(BlobHead)) {
-                    _ = close(fd);
-                    return null;
-                }
-            }
             return .{ .fd = fd, .len = len };
         }
 
-        pub fn blobSwapIn(zone: [*]u8, blob: Blob) bool {
-            return mmapOk(@ptrCast(zone), blob.len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, blob.fd, 0) != null;
-        }
-
-        pub fn blobReadHead(blob: Blob) BlobHead {
-            var h: BlobHead = undefined;
-            if (pread(blob.fd, @ptrCast(&h), @sizeOf(BlobHead), 0) != @sizeOf(BlobHead)) fatal("pread", .{});
-            return h;
-        }
-
-        pub fn blobClose(blob: Blob) void {
+        pub fn blobDestroy(blob: Blob) void {
             _ = close(blob.fd);
+        }
+
+        pub fn blobMap(blob: Blob) ?[]u8 {
+            const p = mmapOk(null, blob.len, PROT_READ | PROT_WRITE, MAP_SHARED, blob.fd, 0) orelse return null;
+            const q: [*]u8 = @ptrCast(p);
+            return q[0..blob.len];
+        }
+
+        pub fn blobUnmap(view: []u8) void {
+            _ = munmap(@ptrCast(view.ptr), view.len);
+        }
+
+        pub fn blobSwapIn(zone: []u8, blob: Blob) bool {
+            std.debug.assert(blob.len <= zone.len);
+            if (mmapOk(@ptrCast(zone.ptr), blob.len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, blob.fd, 0) == null) return false;
+            if (blob.len == zone.len) return true;
+            return mmapOk(@ptrCast(zone.ptr + blob.len), zone.len - blob.len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
 
         pub fn guestPeek32(st: *State, guest_off: usize) i32 {
@@ -356,12 +372,12 @@ const Platform = switch (builtin.os.tag) {
             if (pwrite(st.fd, @ptrCast(&val), 4, @intCast(guest_off)) != 4) fatal("pwrite guest", .{});
         }
 
-        pub fn zonePark(zone: [*]u8, len: usize) bool {
-            return mmapOk(@ptrCast(zone), len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+        pub fn zonePark(zone: []u8) bool {
+            return mmapOk(@ptrCast(zone.ptr), zone.len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
 
-        pub fn zoneUnpark(_: *State, zone: [*]u8, len: usize) bool {
-            return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+        pub fn zoneUnpark(_: *State, zone: []u8) bool {
+            return mmapOk(@ptrCast(zone.ptr), zone.len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
     },
 };
@@ -432,7 +448,7 @@ fn hostNewMemory(
         return c.wasmtime_error_new("host memory: span reservation failed");
     if (!Platform.commitGuestPages(&m.plat, base, 0, minimum))
         return c.wasmtime_error_new("host memory: guest pages commit failed");
-    if (!Platform.commitSwapZone(&m.plat, base + swap_zone_base_offset, swap_zone_size))
+    if (!Platform.commitSwapZone(&m.plat, zoneView(base)))
         return c.wasmtime_error_new("host memory: swap zone commit failed");
 
     m.base = base;
@@ -575,7 +591,7 @@ test {
     const f_poke = try getFunc(ctx, &instance, "poke");
     const f_grow = try getFunc(ctx, &instance, "grow");
     const f_scratch = try getFunc(ctx, &instance, "scratchAddr");
-    const f_zoneLhsStatic = try getFunc(ctx, &instance, "zoneLhsStatic");
+    const f_zoneLoadStatic = try getFunc(ctx, &instance, "zoneLoadStatic");
     const f_zonePokeDynamic = try getFunc(ctx, &instance, "zonePokeDynamic");
     const f_memPages = try getFunc(ctx, &instance, "memPages");
 
@@ -620,35 +636,52 @@ test {
     if (try call1ret(ctx, f_grow, 0x10000) != -1) return error.GrowShouldHaveFailed;
     log.debug("[grow] refused to grow past the zone (returned -1, no trap)", .{});
 
-    const blob_a = Platform.blobCreate(swap_zone_size, .{ .lhs = 10, .rhs = 32 }) orelse fatal("blobCreate(A)", .{});
-    const blob_b = Platform.blobCreate(swap_zone_size, .{ .lhs = 7, .rhs = 5 }) orelse fatal("blobCreate(B)", .{});
-    defer Platform.blobClose(blob_a);
-    defer Platform.blobClose(blob_b);
-
-    if (!Platform.blobSwapIn(base + swap_zone_base_offset, blob_a)) fatal("blobSwapIn(A)", .{});
-    try call0(ctx, f_add);
+    const blob_a = Platform.blobCreate(swap_zone_size) orelse fatal("blobCreate(A)", .{});
+    const blob_b = Platform.blobCreate(swap_zone_size) orelse fatal("blobCreate(B)", .{});
+    defer Platform.blobDestroy(blob_a);
+    defer Platform.blobDestroy(blob_b);
     {
-        const via_va = i32At(base, swap_zone_base_offset).*;
-        const via_fd = Platform.blobReadHead(blob_a);
-        log.debug("[A] {{10,32}} in -> add() -> zone[0]={d} (host VA); blob A via fd: {{{d}, {d}}}", .{ via_va, via_fd.lhs, via_fd.rhs });
-        if (via_va != 42 or via_fd.lhs != 42 or via_fd.rhs != 32) return error.RoundtripAFailed;
+        const a = Platform.blobMap(blob_a) orelse fatal("blobMap(A)", .{});
+        defer Platform.blobUnmap(a);
+        putI32(a, 0, 10);
+        putI32(a, 1, 32);
+        const b = Platform.blobMap(blob_b) orelse fatal("blobMap(B)", .{});
+        defer Platform.blobUnmap(b);
+        putI32(b, 0, 7);
+        putI32(b, 1, 5);
     }
 
-    if (!Platform.blobSwapIn(base + swap_zone_base_offset, blob_b)) fatal("blobSwapIn(B)", .{});
+    if (!Platform.blobSwapIn(zoneView(base), blob_a)) fatal("blobSwapIn(A)", .{});
     try call0(ctx, f_add);
     {
-        const via_va = i32At(base, swap_zone_base_offset).*;
-        const via_fd = Platform.blobReadHead(blob_b);
-        log.debug("[B] {{7,5}} in   -> add() -> zone[0]={d} (host VA); blob B via fd: {{{d}, {d}}}", .{ via_va, via_fd.lhs, via_fd.rhs });
-        if (via_va != 12 or via_fd.lhs != 12 or via_fd.rhs != 5) return error.RoundtripBFailed;
+        const zone = zoneView(base); // host alias of blob A's backing right now
+        const sum = getI32(zone, 0);
+        const a = Platform.blobMap(blob_a) orelse fatal("blobMap(A)", .{});
+        defer Platform.blobUnmap(a);
+        log.debug("[A] {{10,32}} in -> add() -> zone[0]={d} (host VA); blob A via map: {{{d}, {d}}}", .{ sum, getI32(a, 0), getI32(a, 1) });
+        if (sum != 42 or getI32(a, 0) != 42 or getI32(a, 1) != 32) return error.RoundtripAFailed;
     }
 
-    const a = Platform.blobReadHead(blob_a);
-    if (a.lhs != 42 or a.rhs != 32) return error.SwappedOutBlobMutated;
+    if (!Platform.blobSwapIn(zoneView(base), blob_b)) fatal("blobSwapIn(B)", .{});
+    try call0(ctx, f_add);
+    {
+        const zone = zoneView(base);
+        const sum = getI32(zone, 0);
+        const b = Platform.blobMap(blob_b) orelse fatal("blobMap(B)", .{});
+        defer Platform.blobUnmap(b);
+        log.debug("[B] {{7,5}} in   -> add() -> zone[0]={d} (host VA); blob B via map: {{{d}, {d}}}", .{ sum, getI32(b, 0), getI32(b, 1) });
+        if (sum != 12 or getI32(b, 0) != 12 or getI32(b, 1) != 5) return error.RoundtripBFailed;
+    }
+
+    {
+        const a = Platform.blobMap(blob_a) orelse fatal("blobMap(A post-swap)", .{});
+        defer Platform.blobUnmap(a);
+        if (getI32(a, 0) != 42 or getI32(a, 1) != 32) return error.SwappedOutBlobMutated;
+        log.debug("blob A (swapped out) still {{{d}, {d}}} via host view; guest data intact at 0x{x}, 0x{x}, 0x{x}", .{ getI32(a, 0), getI32(a, 1), scr0, scr1, grow_addr });
+    }
     if (Platform.guestPeek32(st, @intCast(scr0)) != val_a) return error.GuestRegionMutated;
     if (Platform.guestPeek32(st, @intCast(scr1)) != val_b) return error.GuestRegionMutated;
     if (Platform.guestPeek32(st, @intCast(grow_addr)) != 0x5151) return error.GuestRegionMutated;
-    log.debug("blob A (swapped out) still {{{d}, {d}}} via fd; guest data intact at 0x{x}, 0x{x}, 0x{x}", .{ a.lhs, a.rhs, scr0, scr1, grow_addr });
 
     log.debug("OK: zero-copy roundtrip complete", .{});
 
@@ -656,7 +689,7 @@ test {
     try expectTrap(ctx, f_echo, 0x7FFF_FFFC);
     try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(swap_zone_base_offset - 4))));
 
-    if (!Platform.zonePark(base + swap_zone_base_offset, swap_zone_size)) return error.ZoneParkFailed;
+    if (!Platform.zonePark(zoneView(base))) return error.ZoneParkFailed;
     try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(swap_zone_base_offset))));
     {
         var trapped = false;
@@ -666,21 +699,30 @@ test {
         if (!trapped) return error.ParkedZoneDidNotTrap;
     }
 
-    if (!Platform.zoneUnpark(st, base + swap_zone_base_offset, swap_zone_size)) return error.ZoneUnparkFailed;
+    if (!Platform.zoneUnpark(st, zoneView(base))) return error.ZoneUnparkFailed;
 
     if (try call0ret(ctx, f_memPages) != host_mem.size / wasm_page_size) return error.MemSizeMismatch;
 
-    const blob_test = Platform.blobCreate(swap_zone_size, .{ .lhs = 100, .rhs = 200 }) orelse fatal("blobCreate(test)", .{});
-    defer Platform.blobClose(blob_test);
-    if (!Platform.blobSwapIn(base + swap_zone_base_offset, blob_test)) fatal("blobSwapIn(test)", .{});
+    const blob_test = Platform.blobCreate(swap_zone_size) orelse fatal("blobCreate(test)", .{});
+    defer Platform.blobDestroy(blob_test);
+    {
+        const v = Platform.blobMap(blob_test) orelse fatal("blobMap(test)", .{});
+        defer Platform.blobUnmap(v);
+        putI32(v, 0, 100);
+        putI32(v, 1, 200);
+    }
+    if (!Platform.blobSwapIn(zoneView(base), blob_test)) fatal("blobSwapIn(test)", .{});
 
-    const static_val = try call0ret(ctx, f_zoneLhsStatic);
+    const static_val = try call0ret(ctx, f_zoneLoadStatic);
     if (static_val != 100) return error.ZoneStaticReadFailed;
 
     try call2(ctx, f_zonePokeDynamic, @bitCast(@as(u32, @intCast(swap_zone_base_offset))), 999);
 
-    const test_head = Platform.blobReadHead(blob_test);
-    if (test_head.lhs != 999) return error.ZoneDynamicWriteFailed;
+    {
+        const v = Platform.blobMap(blob_test) orelse fatal("blobMap(test post)", .{});
+        defer Platform.blobUnmap(v);
+        if (getI32(v, 0) != 999) return error.ZoneDynamicWriteFailed;
+    }
 
     log.debug("OK: both static-offset and dynamic-index zone addressing behave as expected.", .{});
 }
