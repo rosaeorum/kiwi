@@ -548,6 +548,9 @@ test {
     const config = c.wasm_config_new() orelse return error.ConfigNewFailed;
     c.wasmtime_config_host_memory_creator_set(config, &memory_creator);
     c.wasmtime_config_memory_init_cow_set(config, false); // #10740
+    c.wasmtime_config_memory_reservation_set(config, wasm_region_size); // defines the maximum size a 32-bit linear memory can grow into
+    c.wasmtime_config_memory_guard_size_set(config, wasm_region_size); // allows offsets spanning the entire addressable space to bypass explicit bounds checks
+    c.wasmtime_config_memory_may_move_set(config, false); // force wasmtime to treat the reservation as a hard ceiling
     const engine = c.wasm_engine_new_with_config(config) orelse return error.EngineNewFailed;
     defer c.wasm_engine_delete(engine);
 
