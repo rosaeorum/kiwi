@@ -175,9 +175,16 @@ pub fn build(b: *Build) !void {
     memswap_poc_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
     memswap_poc_mod.addImport("helpers", translate_c_dep.module("helpers"));
 
-    memswap_poc_mod.addAnonymousImport("guest.wasm", .{
-        .root_source_file = addZigScript(b, "mem", b.path("static/script/mem.zig")),
-    });
+    const guest_wasm = addZigScript(b, "mem", b.path("static/script/mem.zig"));
+    memswap_poc_mod.addAnonymousImport("guest.wasm", .{ .root_source_file = guest_wasm });
+
+    const wasm2wat = b.addSystemCommand(&.{"wasm2wat"});
+    wasm2wat.addFileArg2(guest_wasm, .{});
+
+    const guest_wat = wasm2wat.captureStdOut(.{});
+
+    const copy_wat = b.addInstallFile(guest_wat, "bin/mem.wat");
+    b.default_step.dependOn(&copy_wat.step);
 
     const memswap_poc_test = b.addTest(.{ .root_module = memswap_poc_mod });
 
@@ -189,6 +196,7 @@ pub fn build(b: *Build) !void {
 
     check_step.dependOn(&memswap_poc_test.step);
     test_step.dependOn(&memswap_poc_test_run.step);
+    test_step.dependOn(&copy_wat.step);
 }
 
 fn appendStatic(mod: *Build.Module) void {
@@ -322,6 +330,8 @@ fn addZigScript(
 
     script_obj.entry = .disabled;
     script_obj.rdynamic = true;
+
+    b.installArtifact(script_obj);
 
     return script_obj.getEmittedBin();
 }

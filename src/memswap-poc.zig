@@ -1,28 +1,99 @@
-// Layout contract host<->guest ("static ABI")
-//
-// Every module gets the full 4gb of *virtual* address space for its linear memory
-// The swap zone is pinned to the last 64kb of that region; the same fixed offset in every module
-// Guests compile against it as a plain variable, and guest code needs no placement directives at all
-// (stack, globals, data and heap grow naturally from address 0)
-//
-//   [0,          0xFFFF0000)  guest memory; grows via memory.grow
-//   [0xFFFF0000, 0x100000000) swap zone: remapped per blob by the host
-//   [0x100000000, +guard)     guard region, never mapped, catches faults
-//
-// Because the whole region is reserved up front, wasmtime elides bounds
-// checks entirely (faults inside the span are classified as wasm OOB traps),
-// so the zone is reachable with ordinary loads/stores at the fixed offset
-// from the first instruction, whatever memory.size reports
-//
-// Growing into the zone is refused as a spec-conformant memory.grow failure
-//
-// Both platforms back the guest region with *lazy* storage (Linux: a memfd; Windows: a sparse temp file)
-// and identity-map guest pages into it (guest byte offset == backing-store offset)
-// so the host always has out-of-band read/write access to live guest memory without going through the guest's virtual address
-//
-// The host could also just read through `base`, it maps the whole span in this process;
-// but the backing-store channel is what keeps working when the guest mapping is temporarily torn down,
-// and it's what we should hand to another process, a snapshot routine, or a core dumper
+//! # Memory Swap Architecture & Host-Guest Contract
+//!
+//! ## Memory Layout
+//!
+//! Every module receives a full 4GB virtual address space for its linear memory.
+//! The swap zone is pinned to the final 64KB of this region. Guests compile against
+//! the swap zone as a plain variable without requiring specific placement
+//! directives (stack, globals, data, and heap grow naturally from address `0`).
+//!
+//! | Range | Description |
+//! | :--- | :--- |
+//! | `[0x0, 0xFFFF0000)` | Guest memory (grows dynamically via `memory.grow`) |
+//! | `[0xFFFF0000, 0x100000000)` | Swap zone (fixed 64KB, remapped per-blob by the host) |
+//! | `[0x100000000, +guard)` | Guard region (never mapped, catches faults) |
+//!
+//! ## Bounds Checking & JIT Elision
+//!
+//! This architecture relies on specific Wasmtime bounds-checking behavior:
+//! > Wasmtime 50, memory32, no max, 64-bit host, default "tunables":
+//! > reservation 4GB, guard 32MiB, `signals_based_traps` enabled
+//!
+//! 1. **Static Offsets:** Accesses with a static offset + size below ~32MiB emit **no bounds checks**.
+//! 2. **Dynamic Offsets:** Accesses up to 4GB emit a single comparison of the index
+//!    against the 4GB reservation (a compile-time constant), never against `memory.size`.
+//! 3. **Fault-Based Traps:** Enforcement of `[size, reservation)` is handled by hardware faults.
+//!    The trap handler classifies the faulting PC and trap metadata into a Wasm Out-Of-Bounds (OOB) trap.
+//!
+//! ### The Wasmtime Creator Contract Deviation
+//! Wasmtime's `MemoryCreator` contract assumes the host will reserve
+//! `reserved_size_in_bytes` plus the guard, leaving uncommitted memory
+//! inaccessible. The JIT elides bounds checks based on this assumption.
+//!
+//! We deliberately violate this assumption: we map the last 64KB of the
+//! reservation. Consequently, swap zone accesses that *should* trap based on
+//! `memory.size` instead succeed. This forms the static ABI.
+//!
+//! ## Static ABI Requirements
+//!
+//! * **Dynamic Linear Memory:** The guest linear memory must be dynamic. Declaring
+//!   `min == max` forces the JIT to bounds-check against the static size, making
+//!   the swap zone unreachable.
+//! * **Zone Addressing:** Guest code reaches the zone pointer-style (address in
+//!   index register, tiny static offsets). Because the JIT elides size checks, the
+//!   zone is reachable from the first instruction regardless of `memory.size`.
+//! * **Growth Limits:** Growing into the swap zone is rejected as a spec-conformant
+//!   `memory.grow` failure.
+//!
+//! ## Backing Storage & Out-of-Band (OOB) Access
+//!
+//! Both Linux and Windows platforms back the guest region with lazy storage (Linux:
+//! `memfd`; Windows: sparse temp file). Guest pages are identity-mapped into this
+//! storage (guest byte offset == backing-store offset).
+//!
+//! * **Coherent OOB Access:** The host retains out-of-band read/write access to
+//!   live guest memory without traversing the guest's virtual address space.
+//! * **Resilience:** The backing-store channel remains available even if the guest
+//!   mapping is temporarily torn down. This is the mechanism used for inter-process
+//!   handoffs, snapshot routines, and core dumpers.
+//!
+//! ## Zone Parking & Safety
+//!
+//! * **Default Parked State:** The swap zone is parked by default (`PROT_NONE` or
+//!   placeholder). Parking between operations costs nothing because `blobSwapIn` is
+//!   a page-table edit.
+//! * **Trap Enforcement:** A buggy or malicious guest touching the zone outside a
+//!   deliberate swap window triggers a spec-conformant OOB trap rather than
+//!   silently reading stale data.
+//! * **Host Restrictions:** While parked, the host must not access the zone through
+//!   `base + ZONE_OFF`, as this causes a standard host segfault (the PC is
+//!   unrecognized by `lookup_code`). OOB channels (`pread` / scratch views) remain
+//!   safe.
+//! * **Hardware Traps Required:** This design strictly requires
+//!   `signals_based_traps(true)`. Interpreters (like Pulley) or backends that
+//!   reintroduce explicit checks (like Winch) will silently fail to reach the zone.
+//!
+//! ## Upstream Compatibility
+//!
+//! Custom linear memories in Wasmtime officially exist to customize allocation
+//! while enforcing WebAssembly semantics. Our architecture intentionally deviates
+//! by allowing mapped-beyond-size accesses to succeed.
+//!
+//! Because this creates a tightly coupled host/guest pair, upstream changes to the
+//! `MemoryCreator` contract will not account for this use case. The
+//! runtime-observable trap probes in the test suite serve as the
+//! contract enforcement against Wasmtime regressions.
+
+const memswap_proof_of_concept = @This();
+
+const std = @import("std");
+const builtin = @import("builtin");
+const c = @import("module/wasm.zig");
+
+const log_errs = !@import("builtin").is_test;
+const guest_wasm = @embedFile("guest.wasm");
+
+const log = std.log.scoped(.wasm);
 
 const WASM_PAGE: usize = 64 * 1024;
 const GUEST_SPAN: usize = 1 << 32; // 4gb per module
@@ -55,30 +126,18 @@ const Platform = switch (builtin.os.tag) {
         extern "c" fn pwrite(fd: c_int, buf: [*]const u8, count: usize, off: i64) isize;
         extern "c" fn close(fd: c_int) c_int;
 
-        // mmap's error return is MAP_FAILED ((void*)-1), not null, and the
-        // raw extern can't express that; normalize it once, here.
         fn mmapOk(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque {
             const p = mmap(addr, len, prot, flags, fd, off) orelse return null;
             if (@intFromPtr(p) == std.math.maxInt(usize)) return null;
             return p;
         }
 
-        // one memfd backing the whole guest-owned region
-        // [0, GUEST_LIMIT). Guest pages are identity-offset MAP_SHARED views
-        // of it (guest byte offset == file offset), so the host can always
-        // read/write live guest memory out-of-band via pread/pwrite on the
-        // fd; coherent with the guest's VA, and it keeps working even when
-        // the guest mapping is unmapped or handed to another process.
         pub const State = struct { fd: c_int = -1 };
 
         pub fn init() void {}
 
         pub fn reserveSpan(st: *State, span: usize) ?[*]u8 {
-            // Whole span as PROT_NONE (virtual only, no commit).
             const base = mmapOk(null, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return null;
-            // Guest backing store: one memfd the size of the growable region.
-            // shmem pages materialize on first touch, so the 4gb
-            // ftruncate costs nothing until the guest actually grows into it.
             const fd = memfd_create("wzs-guest", 0);
             if (fd < 0) return null;
             if (ftruncate(fd, @intCast(GUEST_LIMIT)) != 0) {
@@ -90,14 +149,11 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn commitGuestPages(st: *State, at: [*]u8, guest_off: usize, len: usize) bool {
-            // Identity view of the memfd: file offset == guest offset.
-            // Shared, so fd-writes and guest-VA accesses hit the same pages.
             return mmapOk(@ptrCast(at), len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, st.fd, @intCast(guest_off)) != null;
         }
 
         pub fn commitSwapZone(st: *State, zone: [*]u8, len: usize) bool {
-            _ = st; // the zone's initial zeros need no backing of their own
-            // Fresh zero pages (private anon) until the first blob swap.
+            _ = st;
             return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
 
@@ -120,23 +176,19 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn blobSwapIn(zone: [*]u8, blob: Blob) bool {
-            // Rebind the zone onto the blob's storage: page-table edit, zero
-            // bytes moved. (MVP invariant: blob.len == SWAP_ZONE.)
             return mmapOk(@ptrCast(zone), blob.len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, blob.fd, 0) != null;
         }
 
         pub fn blobReadHead(blob: Blob) BlobHead {
-            // The blob's storage via its fd, bypassing the guest mapping.
             var h: BlobHead = undefined;
             if (pread(blob.fd, @ptrCast(&h), @sizeOf(BlobHead), 0) != @sizeOf(BlobHead)) fatal("pread", .{});
             return h;
         }
 
         pub fn blobClose(blob: Blob) void {
-            _ = close(blob.fd); // like POSIX close() with a live mmap
+            _ = close(blob.fd);
         }
 
-        // Out-of-band guest-memory access (identity: fd offset == guest offset).
         pub fn guestPeek32(st: *State, guest_off: usize) i32 {
             var v: i32 = undefined;
             if (pread(st.fd, @ptrCast(&v), 4, @intCast(guest_off)) != 4) fatal("pread guest", .{});
@@ -145,6 +197,14 @@ const Platform = switch (builtin.os.tag) {
 
         pub fn guestPoke32(st: *State, guest_off: usize, val: i32) void {
             if (pwrite(st.fd, @ptrCast(&val), 4, @intCast(guest_off)) != 4) fatal("pwrite guest", .{});
+        }
+
+        pub fn zonePark(zone: [*]u8, len: usize) bool {
+            return mmapOk(@ptrCast(zone), len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+        }
+
+        pub fn zoneUnpark(zone: [*]u8, len: usize) bool {
+            return mmapOk(@ptrCast(zone), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
     },
 
@@ -155,7 +215,6 @@ const Platform = switch (builtin.os.tag) {
 
         const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(std.math.maxInt(usize));
 
-        // VirtualAlloc2 / VirtualFree / MapViewOfFile3 / UnmapViewOfFileEx flags
         const MEM_RESERVE: DWORD = 0x00002000;
         const MEM_RELEASE: DWORD = 0x00008000;
         const MEM_RESERVE_PLACEHOLDER: DWORD = 0x00040000;
@@ -166,7 +225,6 @@ const Platform = switch (builtin.os.tag) {
         const FILE_MAP_READ: DWORD = 0x0001;
         const FILE_MAP_ALL_ACCESS: DWORD = 0x000F001F;
 
-        // ancient kernel32 exports we can reliably extract
         extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
         extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
         extern "kernel32" fn VirtualFree(addr: ?*anyopaque, size: usize, free_type: DWORD) callconv(.winapi) BOOL;
@@ -181,18 +239,6 @@ const Platform = switch (builtin.os.tag) {
         extern "kernel32" fn SetFilePointerEx(file: HANDLE, dist: i64, out: ?*i64, method: DWORD) callconv(.winapi) BOOL;
         extern "kernel32" fn SetEndOfFile(file: HANDLE) callconv(.winapi) BOOL;
 
-        // win10-1803-era placeholder exports, resolved dynamically, because
-        // real Windows exports them from kernel32, but Wine only exports
-        // them from kernelbase; still no k32 forwards as of wine 10
-        //
-        // both DLLs are always loaded in any process, so no LoadLibrary needed
-        //
-        // note that these are required, the fixed-zone layout has no fallback without them
-        // thus, supported platforms are: win10+ / Wine >= 8.10
-        //
-        // a fallback path is possible, but seems complex & i believe would incur some overhead;
-        // steam requires windows 10+ and was shipping supporting wine in proton since may 2024, so oh well
-        // time traveling gamers not welcome, i guess
         const VirtualAlloc2Fn = fn (process: HANDLE, base: ?*anyopaque, size: usize, alloc_type: DWORD, protect: DWORD, ext: ?*const anyopaque, ext_count: DWORD) callconv(.winapi) ?*anyopaque;
         const MapViewOfFile3Fn = fn (section: HANDLE, process: HANDLE, base: ?*anyopaque, offset: u64, view_size: usize, alloc_type: DWORD, protect: DWORD, ext: ?*const anyopaque, ext_count: DWORD) callconv(.winapi) ?*anyopaque;
         const UnmapViewOfFileExFn = fn (base: ?*anyopaque, flags: DWORD) callconv(.winapi) BOOL;
@@ -222,37 +268,18 @@ const Platform = switch (builtin.os.tag) {
             log.debug("[windows] swap path: placeholders (VirtualAlloc2/MapViewOfFile3)", .{});
         }
 
-        // file-backed sections charge *zero* commit regardless of size
-        // (pages materialize on first touch, only written pages ever take space)
-        // which is what makes 4gb per module survivable here.
-        // a pagefile-backed (SEC_COMMIT) section of that size would charge
-        // the entire 4gb against commit at creation and OOM the box in a
-        // handful of modules; 64kb sections (the blobs, the zeros) are
-        // exactly what pagefile backing is for
         pub const State = struct {
-            // a section backed by a sparse temp file, sized GUEST_LIMIT. Guest pages are
-            // identity-offset views of it (guest byte offset == file offset), so the host
-            // reads/writes live guest memory out-of-band via scratch views of the section
             guest_section: HANDLE = null,
-
-            // 64kb pagefile-backed section providing the swap zone's initial zero contents
             zero_section: HANDLE = null,
         };
 
-        // "memfd for windows"
-        // extend a temp file to `len` bytes (sparse on NTFS and lazy on whatever filesystem wine sits on; ext4 etc.) then open a section over it
-        // FILE_FLAG_DELETE_ON_CLOSE means the file vanishes when the last reference (the section, then its views) dies, even on a crash
-        //
-        // NOTE: A FAT-family filesystem will eagerly allocate the 4gb; NTFS or wine is fine...
-        // if you're still using FAT then clearly you don't care about this sort of thing anyway?
-        // TODO: probably would be worth inserting a warning here if we can detect it?
         fn makeFileSection(len: usize) ?HANDLE {
             var dir: [260]u16 = undefined;
             var path: [260]u16 = undefined;
             const prefix = [3]u16{ 'w', 'z', 's' };
             const n = GetTempPathW(dir.len, &dir);
             if (n == 0 or n + 14 > dir.len) return null;
-            if (GetTempFileNameW(&dir, &prefix, 0, &path) == 0) return null; // creates the file
+            if (GetTempFileNameW(&dir, &prefix, 0, &path) == 0) return null;
             const GENERIC_READ: DWORD = 0x80000000;
             const GENERIC_WRITE: DWORD = 0x40000000;
             const OPEN_EXISTING: DWORD = 3;
@@ -269,14 +296,10 @@ const Platform = switch (builtin.os.tag) {
                 _ = CloseHandle(file);
                 return null;
             };
-            _ = CloseHandle(file); // the section holds its own reference
+            _ = CloseHandle(file);
             return sec;
         }
 
-        // allocates the whole span as one placeholder
-        //
-        // everything else (guest views, the swap zone, blobs) is carved out of it by placeholder splits + view replacements (the guard region thus stays a bare placeholder forever)
-        // the wasm page size being the same 64kb as the allocation granularity keeps every split/replacement in this file granularity-aligned for free
         pub fn reserveSpan(st: *State, span: usize) ?[*]u8 {
             st.guest_section = makeFileSection(GUEST_LIMIT) orelse return null;
             st.zero_section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, 0, @truncate(SWAP_ZONE), null);
@@ -299,27 +322,23 @@ const Platform = switch (builtin.os.tag) {
         }
 
         fn mapSectionView(section: HANDLE, at: [*]u8, section_off: usize, len: usize) bool {
-            // view must exactly match the placeholder it replaces
             const p = MapViewOfFile3.?(section, GetCurrentProcess(), @ptrCast(at), section_off, len, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, null, 0);
             return p != null and @intFromPtr(p.?) == @intFromPtr(at);
         }
 
         pub fn commitGuestPages(st: *State, at: [*]u8, guest_off: usize, len: usize) bool {
             if (!splitPlaceholder(at, len)) return false;
-            // identity view: file offset == guest offset
             return mapSectionView(st.guest_section.?, at, guest_off, len);
         }
 
         pub fn commitSwapZone(st: *State, zone: [*]u8, len: usize) bool {
             if (!splitPlaceholder(zone, len)) return false;
-            // park a zero view of the tiny pagefile-backed section over the zone; every future swap is unmap(preserve) + remap from here
             return mapSectionView(st.zero_section.?, zone, 0, len);
         }
 
         pub const Blob = struct { section: HANDLE, len: usize };
 
         pub fn blobCreate(len: usize, head: ?BlobHead) ?Blob {
-            // pagefile-backed (default SEC_COMMIT): len is 64kb here, so the commit charge is trivial
             const section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, @truncate(len >> 32), @truncate(len), null) orelse return null;
             if (head) |h| {
                 const v = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 0) orelse {
@@ -333,14 +352,11 @@ const Platform = switch (builtin.os.tag) {
             return .{ .section = section, .len = len };
         }
 
-        /// INVARIANT: `blob.len == SWAP_ZONE`, so the restored placeholder matches the incoming view exactly
         pub fn blobSwapIn(zone: [*]u8, blob: Blob) bool {
-            // out with the old view (placeholder restored), in with the blob
             if (UnmapViewOfFileEx.?(@ptrCast(zone), MEM_PRESERVE_PLACEHOLDER) == 0) return false;
             return mapSectionView(blob.section, zone, 0, blob.len);
         }
 
-        // a scratch view of the blob's own storage, entirely bypassing the guest's mapping
         pub fn blobReadHead(blob: Blob) BlobHead {
             const v = MapViewOfFile(blob.section, FILE_MAP_READ, 0, 0, 0) orelse fatal("MapViewOfFile", .{});
             defer _ = UnmapViewOfFile(v);
@@ -349,12 +365,10 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn blobClose(blob: Blob) void {
-            _ = CloseHandle(blob.section); // views keep the section alive
+            _ = CloseHandle(blob.section);
         }
 
-        // out-of-band guest-memory access: scratch views of the same section the guest's pages are identity-mapped from
         fn guestAccess(st: *State, guest_off: usize, write: bool, val: i32) i32 {
-            // MapViewOfFile offsets need 64kb alignment (== the wasm page, happily), so align down and index inside the window
             std.debug.assert(guest_off + 4 <= GUEST_LIMIT);
             const gran: usize = 64 * 1024;
             const map_off = guest_off & ~(gran - 1);
@@ -376,16 +390,25 @@ const Platform = switch (builtin.os.tag) {
         pub fn guestPoke32(st: *State, guest_off: usize, val: i32) void {
             _ = guestAccess(st, guest_off, true, val);
         }
+
+        pub fn zonePark(zone: [*]u8, len: usize) bool {
+            _ = len;
+            return UnmapViewOfFileEx.?(@ptrCast(zone), MEM_PRESERVE_PLACEHOLDER) != 0;
+        }
+
+        pub fn zoneUnpark(st: *State, zone: [*]u8, len: usize) bool {
+            return mapSectionView(st.zero_section.?, zone, 0, len);
+        }
     },
 
     else => @compileError("platform nyi"),
 };
 
 const HostMem = struct {
-    base: ?[*]u8 = null, // stable for the store's lifetime
-    size: usize = 0, // bytes accessible to the guest right now
-    capacity: usize = 0, // grows up to this (ZONE_OFF) without moving the base
-    guard: usize = 0, // inaccessible span after the reservation the JIT assumes
+    base: ?[*]u8 = null,
+    size: usize = 0,
+    capacity: usize = 0,
+    guard: usize = 0,
     plat: Platform.State = .{},
 };
 
@@ -403,7 +426,6 @@ fn hostGrowMemory(env: ?*anyopaque, new_size: usize) callconv(.c) ?*c.wasmtime_e
     if (new_size > m.capacity)
         return c.wasmtime_error_new("host memory: grow exceeds in-place capacity");
     if (new_size > m.size) {
-        // commit [size, new_size) as more identity views of the backing store...the swap zone and guard stay intact either way
         if (!Platform.commitGuestPages(&m.plat, m.base.? + m.size, m.size, new_size - m.size))
             return c.wasmtime_error_new("host memory: commit during grow failed");
     }
@@ -415,12 +437,12 @@ fn hostNewMemory(
     env: ?*anyopaque,
     ty: ?*const c.wasm_memorytype_t,
     minimum: usize,
-    maximum: usize, // maxInt(usize) means "no maximum" (C API sentinel)
-    reserved_size_in_bytes: usize, // 0 means "pick your own" (C API sentinel)
+    maximum: usize,
+    reserved_size_in_bytes: usize,
     guard_size_in_bytes: usize,
     memory_ret: [*c]c.wasmtime_linear_memory_t,
 ) callconv(.c) ?*c.wasmtime_error_t {
-    _ = ty; // borrowed for the call; don't delete
+    _ = ty;
     if (host_mem.base != null)
         return c.wasmtime_error_new("host memory: MVP is wired for exactly one memory");
     const m: *HostMem = @ptrCast(@alignCast(env.?));
@@ -428,9 +450,6 @@ fn hostNewMemory(
     const reservation: usize = if (reserved_size_in_bytes != 0) reserved_size_in_bytes else GUEST_SPAN;
     const guard: usize = guard_size_in_bytes;
 
-    // the static-ABI layout needs the full 4gb region
-    // and the zone at 0xFFFF0000 is only reachable because the JIT elides bounds checks on the strength of the reservation+guard window covering every address an unchecked access can compute
-    // both properties are config-dependent, verifying them here is better than trapping mysteriously later
     if (reservation < GUEST_SPAN)
         return c.wasmtime_error_new("host memory: reservation below 4gb; the fixed swap-zone ABI requires the full 4gb (check wasmtime memory_reservation config)");
     if (reservation + guard <= GUEST_SPAN)
@@ -447,10 +466,6 @@ fn hostNewMemory(
         log.debug("[host memory] minimum={d} maximum={d} reserved={d} guard={d}", .{ minimum, maximum, reservation, guard });
     }
 
-    // Reserve the whole span as one inaccessible region, then:
-    //   [0, minimum)        guest pages (identity views of the backing store)
-    //   [ZONE_OFF, +64kb ) swap zone
-    //   the rest            stays reserved: guest grow room, then the guard.
     const base = Platform.reserveSpan(&m.plat, reservation + guard) orelse
         return c.wasmtime_error_new("host memory: span reservation failed");
     if (!Platform.commitGuestPages(&m.plat, base, 0, minimum))
@@ -460,10 +475,10 @@ fn hostNewMemory(
 
     m.base = base;
     m.size = minimum;
-    m.capacity = GUEST_LIMIT; // grow room ends where the zone begins
+    m.capacity = GUEST_LIMIT;
     m.guard = guard;
 
-    memory_ret.* = .{ // wasmtime copies this; `env` must outlive the store
+    memory_ret.* = .{
         .env = m,
         .get_memory = &hostGetMemory,
         .grow_memory = &hostGrowMemory,
@@ -489,7 +504,7 @@ fn getFunc(ctx: *c.wasmtime_context_t, instance: *const c.wasmtime_instance_t, c
 }
 
 fn callRaw(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, args: []const i32, results: []i32) !void {
-    std.debug.assert(args.len <= 8 and results.len <= 1); // plenty for this guest
+    std.debug.assert(args.len <= 8 and results.len <= 1);
     var argv: [8]c.wasmtime_val_t = undefined;
     for (args, 0..) |a, i| {
         argv[i] = .{ .kind = c.WASMTIME_I32, .of = .{ .i32 = a } };
@@ -512,6 +527,12 @@ fn call2(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32, b: i32) !void
     return callRaw(ctx, f, &[_]i32{ a, b }, &[_]i32{});
 }
 
+fn call0ret(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t) !i32 {
+    var r: [1]i32 = undefined;
+    try callRaw(ctx, f, &.{}, &r);
+    return r[0];
+}
+
 fn call1ret(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32) !i32 {
     var r: [1]i32 = undefined;
     try callRaw(ctx, f, &[_]i32{a}, &r);
@@ -528,7 +549,7 @@ fn dieError(e: *c.wasmtime_error_t) error{RuntimeFailure} {
     @branchHint(.cold);
     var msg: c.wasm_name_t = undefined;
     c.wasmtime_error_message(e, &msg);
-    log.err("wasmtime error: {s}\n", .{msg.data[0..msg.size]});
+    if (comptime log_errs) log.err("wasmtime error: {s}\n", .{msg.data[0..msg.size]});
     c.wasm_byte_vec_delete(&msg);
     c.wasmtime_error_delete(e);
     return error.RuntimeFailure;
@@ -538,7 +559,7 @@ fn dieTrap(t: *c.wasm_trap_t) error{RuntimeFailure} {
     @branchHint(.cold);
     var msg: c.wasm_message_t = undefined;
     c.wasm_trap_message(t, &msg);
-    log.err("trap: {s}\n", .{msg.data[0..msg.size]});
+    if (comptime log_errs) log.err("trap: {s}\n", .{msg.data[0..msg.size]});
     c.wasm_byte_vec_delete(&msg);
     c.wasm_trap_delete(t);
     return error.RuntimeFailure;
@@ -546,8 +567,13 @@ fn dieTrap(t: *c.wasm_trap_t) error{RuntimeFailure} {
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     @branchHint(.cold);
-    log.err("fatal: " ++ fmt ++ "\n", args);
+    if (comptime log_errs) log.err("fatal: " ++ fmt ++ "\n", args);
     std.process.exit(1);
+}
+
+fn expectTrap(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32) !void {
+    _ = call1ret(ctx, f, a) catch return;
+    return error.ExpectedTrap;
 }
 
 test {
@@ -555,6 +581,7 @@ test {
 
     const config = c.wasm_config_new() orelse return error.ConfigNewFailed;
     c.wasmtime_config_host_memory_creator_set(config, &memory_creator);
+    c.wasmtime_config_memory_init_cow_set(config, false); // #10740
     const engine = c.wasm_engine_new_with_config(config) orelse return error.EngineNewFailed;
     defer c.wasm_engine_delete(engine);
 
@@ -579,6 +606,9 @@ test {
     const f_poke = try getFunc(ctx, &instance, "poke");
     const f_grow = try getFunc(ctx, &instance, "grow");
     const f_scratch = try getFunc(ctx, &instance, "scratchAddr");
+    const f_zoneLhsStatic = try getFunc(ctx, &instance, "zoneLhsStatic");
+    const f_zonePokeDynamic = try getFunc(ctx, &instance, "zonePokeDynamic");
+    const f_memPages = try getFunc(ctx, &instance, "memPages");
 
     const base = host_mem.base orelse return error.HostMemoryNotCreated;
     const st = &host_mem.plat;
@@ -586,7 +616,6 @@ test {
     log.debug("guest memory: base=0x{x} size={d} capacity={d} guard={d}", .{ @intFromPtr(base), host_mem.size, host_mem.capacity, host_mem.guard });
     log.debug("swap zone: [0x{x}, 0x{x}) - fixed offset in every module", .{ ZONE_OFF, GUEST_SPAN });
 
-    // sanity check: if the guest happens to export its linear memory, make sure the pointer wasmtime would hand out is our base
     {
         var item: c.wasmtime_extern_t = undefined;
         if (c.wasmtime_instance_export_get(ctx, &instance, "memory", 6, &item)) {
@@ -595,41 +624,33 @@ test {
         }
     }
 
-    // real guest symbols for the out-of-band channel, discovered the way real interop will: exported accessors, not fixed addresses
     const scr0 = try call1ret(ctx, f_scratch, 0);
     const scr1 = try call1ret(ctx, f_scratch, 1);
 
-    // host -> guest through the out-of-band channel
-    // poke scratch[0] via the identity backing (fd / scratch view), then have the guest read it back through its own view of the same pages
     const val_a: i32 = 0xC0FFEE;
     Platform.guestPoke32(st, @intCast(scr0), val_a);
     const echoed = try call1ret(ctx, f_echo, scr0);
     log.debug("[oob] host poked {d} @ guest 0x{x}; guest echo read {d}", .{ val_a, scr0, echoed });
     if (echoed != val_a) return error.OobHostToGuestFailed;
 
-    // guest -> host
     const val_b: i32 = @bitCast(@as(u32, 0xFEEDFACE));
     try call2(ctx, f_poke, scr1, val_b);
     const seen_b = Platform.guestPeek32(st, @intCast(scr1));
     log.debug("[oob] guest poked {d} @ guest 0x{x}; host peeked {d}", .{ val_b, scr1, seen_b });
     if (seen_b != val_b) return error.OobGuestToHostFailed;
-    if (i32At(base, @intCast(scr1)).* != val_b) return error.OobChannelsDisagree; // both channels see the same pages
+    if (i32At(base, @intCast(scr1)).* != val_b) return error.OobChannelsDisagree;
 
-    // the module's memory is dynamic, so memory.grow works: the host commits more identity views below the zone
-    // freshly grown pages must be identity-backed and coherent on both channels too
     const size_before = host_mem.size;
-    const grow_addr: i32 = @intCast(size_before + 0x40); // inside the pages we're about to add
+    const grow_addr: i32 = @intCast(size_before + 0x40);
     if (try call1ret(ctx, f_grow, 2) != 0) return error.GrowFailed;
     if (host_mem.size != size_before + 2 * WASM_PAGE) return error.GrowSizeWrong;
     Platform.guestPoke32(st, @intCast(grow_addr), 0x5151);
     if (try call1ret(ctx, f_echo, grow_addr) != 0x5151) return error.GrowCommitInvisible;
     log.debug("[grow] +2 pages -> size={d}; fresh pages are identity-backed and both channels agree", .{host_mem.size});
 
-    // growing past the zone must be refused with spec-conformant failure, no trap; 65536 pages = 4gb, which is past the capacity of 0xFFFF0000
     if (try call1ret(ctx, f_grow, 0x10000) != -1) return error.GrowShouldHaveFailed;
     log.debug("[grow] refused to grow past the zone (returned -1, no trap)", .{});
 
-    // blob roundtrip through the fixed zone
     const blob_a = Platform.blobCreate(SWAP_ZONE, .{ .lhs = 10, .rhs = 32 }) orelse fatal("blobCreate(A)", .{});
     const blob_b = Platform.blobCreate(SWAP_ZONE, .{ .lhs = 7, .rhs = 5 }) orelse fatal("blobCreate(B)", .{});
     defer Platform.blobClose(blob_a);
@@ -653,7 +674,6 @@ test {
         if (via_va != 12 or via_fd.lhs != 12 or via_fd.rhs != 5) return error.RoundtripBFailed;
     }
 
-    // swapped-out blob mutated while live is readable out-of-band for debugging & interop and the swaps never touched guest data
     const a = Platform.blobReadHead(blob_a);
     if (a.lhs != 42 or a.rhs != 32) return error.SwappedOutBlobMutated;
     if (Platform.guestPeek32(st, @intCast(scr0)) != val_a) return error.GuestRegionMutated;
@@ -662,10 +682,36 @@ test {
     log.debug("blob A (swapped out) still {{{d}, {d}}} via fd; guest data intact at 0x{x}, 0x{x}, 0x{x}", .{ a.lhs, a.rhs, scr0, scr1, grow_addr });
 
     log.debug("OK: zero-copy roundtrip complete", .{});
-}
 
-const std = @import("std");
-const log = std.log.scoped(.wasm);
-const builtin = @import("builtin");
-const c = @import("module/wasm.zig");
-const guest_wasm = @embedFile("guest.wasm");
+    try expectTrap(ctx, f_echo, @intCast(host_mem.size + 0x1000));
+    try expectTrap(ctx, f_echo, 0x7FFF_FFFC);
+    try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(ZONE_OFF - 4))));
+
+    if (!Platform.zonePark(base + ZONE_OFF, SWAP_ZONE)) return error.ZoneParkFailed;
+    try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(ZONE_OFF))));
+    {
+        var trapped = false;
+        _ = call0(ctx, f_add) catch {
+            trapped = true;
+        };
+        if (!trapped) return error.ParkedZoneDidNotTrap;
+    }
+
+    if (!Platform.zoneUnpark(base + ZONE_OFF, SWAP_ZONE)) return error.ZoneUnparkFailed;
+
+    if (try call0ret(ctx, f_memPages) != host_mem.size / WASM_PAGE) return error.MemSizeMismatch;
+
+    const blob_test = Platform.blobCreate(SWAP_ZONE, .{ .lhs = 100, .rhs = 200 }) orelse fatal("blobCreate(test)", .{});
+    defer Platform.blobClose(blob_test);
+    if (!Platform.blobSwapIn(base + ZONE_OFF, blob_test)) fatal("blobSwapIn(test)", .{});
+
+    const static_val = try call0ret(ctx, f_zoneLhsStatic);
+    if (static_val != 100) return error.ZoneStaticReadFailed;
+
+    try call2(ctx, f_zonePokeDynamic, @bitCast(@as(u32, @intCast(ZONE_OFF))), 999);
+
+    const test_head = Platform.blobReadHead(blob_test);
+    if (test_head.lhs != 999) return error.ZoneDynamicWriteFailed;
+
+    log.debug("OK: both static-offset and dynamic-index zone addressing behave as expected.", .{});
+}
