@@ -174,18 +174,6 @@ pub fn build(b: *Build) !void {
     memswap_poc_mod.linkSystemLibrary("wasmtime", .{});
     memswap_poc_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
     memswap_poc_mod.addImport("helpers", translate_c_dep.module("helpers"));
-
-    const guest_wasm = addZigScript(b, "mem", b.path("static/script/mem.zig"));
-    memswap_poc_mod.addAnonymousImport("guest.wasm", .{ .root_source_file = guest_wasm });
-
-    const wasm2wat = b.addSystemCommand(&.{"wasm2wat"});
-    wasm2wat.addFileArg2(guest_wasm, .{});
-
-    const guest_wat = wasm2wat.captureStdOut(.{});
-
-    const copy_wat = b.addInstallFile(guest_wat, "bin/mem.wat");
-    b.default_step.dependOn(&copy_wat.step);
-
     const memswap_poc_test = b.addTest(.{ .root_module = memswap_poc_mod });
 
     if (is_windows) {
@@ -196,7 +184,6 @@ pub fn build(b: *Build) !void {
 
     check_step.dependOn(&memswap_poc_test.step);
     test_step.dependOn(&memswap_poc_test_run.step);
-    test_step.dependOn(&copy_wat.step);
 }
 
 fn appendStatic(mod: *Build.Module) void {
@@ -307,12 +294,6 @@ fn addZigScript(
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
-        // Enforce the multi-memory feature flag
-        .cpu_features_add = feats: {
-            var feats = base.Target.Cpu.Feature.Set.empty;
-            feats.addFeature(@intFromEnum(base.Target.wasm.Feature.multimemory));
-            break :feats feats;
-        },
     });
 
     const shader_mod = b.createModule(.{
@@ -324,8 +305,8 @@ fn addZigScript(
     const script_obj = b.addExecutable(.{
         .name = name,
         .root_module = shader_mod,
-        .use_llvm = true,
-        // .use_lld = false,
+        .use_llvm = false,
+        .use_lld = false,
     });
 
     script_obj.entry = .disabled;

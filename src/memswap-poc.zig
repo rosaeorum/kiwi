@@ -91,7 +91,6 @@ const builtin = @import("builtin");
 const c = @import("module/wasm.zig");
 
 const log_errs = !@import("builtin").is_test;
-const guest_wasm = @embedFile("guest.wasm");
 
 const log = std.log.scoped(.wasm);
 
@@ -578,6 +577,91 @@ fn expectTrap(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32) !void {
 
 test {
     Platform.init();
+
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "zig-out");
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "zig-out/memswap-poc-guest.zig",
+        .data =
+        \\const std = @import("std");
+        \\pub const ZONE_ADDR: usize = 0xFFFF_0000;
+        \\pub const ZONE_LEN: usize = 64 * 1024;
+        \\pub const BlobHead = extern struct { lhs: i32, rhs: i32 };
+        \\const zone: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
+        // stand-in for an ecs system, operates on swapped zone data
+        \\export fn add() void {
+        \\    zone.lhs = zone.lhs + zone.rhs;
+        \\}
+        // read an i32 from anywhere in guest memory
+        // the host uses this to verify its out-of-band writes through the identity backing are guest-visible
+        \\export fn echo(addr: u32) i32 {
+        \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
+        \\    return p.*;
+        \\}
+        // write an i32 anywhere in guest memory
+        // the host verifies it out-of-band
+        \\export fn poke(addr: u32, val: i32) void {
+        \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
+        \\    p.* = val;
+        \\}
+        // grow linear memory by `pages` pages;
+        // 0 on success, -1 (per wasm spec) if the host refuses; e.g. growing into the swap zone
+        \\export fn grow(pages: u32) i32 {
+        \\    if (@wasmMemoryGrow(0, pages) != -1) return 0;
+        \\    return -1;
+        \\}
+        // tests guest's own data section
+        \\export var scratch: [3]i32 = .{ 0, 0, 0 };
+        \\export fn scratchAddr(idx: u32) u32 {
+        \\    return @intCast(@intFromPtr(&scratch[idx]));
+        \\}
+        // zone reachability via BOTH addressing forms, so a wasmtime config or
+        // regression that reintroduces current-size bounds checks fails the suite
+        \\export fn zoneLhsStatic() i32 { // folds to: i32.load offset=0xFFFF0000
+        \\    const h: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
+        \\    return h.lhs;
+        \\}
+        // test runtime pointer in the index register
+        \\export fn zonePokeDynamic(base: u32, val: i32) void {
+        \\    const h: *align(1) BlobHead = @ptrFromInt(@as(usize, base));
+        \\    h.lhs = val;
+        \\}
+        // returns memory.size exactly as the JIT sees it
+        \\export fn memPages() u32 {
+        \\    return @wasmMemorySize(0);
+        \\}
+        ,
+    });
+    defer {
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/memswap-poc-guest.zig") catch |err| {
+            log.warn("failed to delete test file: {s}", .{@errorName(err)});
+        };
+    }
+
+    var zig = try std.process.spawn(std.testing.io, .{
+        .argv = &.{
+            // zig fmt: off
+            "zig", "build-exe",
+            "zig-out/memswap-poc-guest.zig",
+            "-target", "wasm32-freestanding",
+            "-O", "fast",
+            "-fno-llvm", "-fno-lld",
+            "-fno-entry", "-rdynamic",
+            "-femit-bin=zig-out/memswap-poc-guest.wasm",
+            // zig fmt: on
+        },
+    });
+
+    const term = try zig.wait(std.testing.io);
+    if (!term.success()) return error.FailedToCompileWasm;
+
+    const guest_wasm = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-out/memswap-poc-guest.wasm", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(guest_wasm);
+    defer {
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/memswap-poc-guest.wasm") catch |err| {
+            log.warn("failed to delete test file: {s}", .{@errorName(err)});
+        };
+    }
 
     const config = c.wasm_config_new() orelse return error.ConfigNewFailed;
     c.wasmtime_config_host_memory_creator_set(config, &memory_creator);
