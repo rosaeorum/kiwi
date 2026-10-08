@@ -5,16 +5,11 @@ pub const ZONE_LEN: usize = 64 * 1024;
 
 pub const BlobHead = extern struct { lhs: i32, rhs: i32 };
 
-const zone_base: usize = ZONE_ADDR;
-
-inline fn zone() *align(1) BlobHead {
-    return @ptrFromInt(zone_base);
-}
+const zone: *align(1) BlobHead = @ptrFromInt(ZONE_ADDR);
 
 /// swap zone layout: { lhs: i32, rhs: i32 } - lhs += rhs.
 export fn add() void {
-    const h = zone();
-    h.lhs = h.lhs + h.rhs;
+    zone.lhs = zone.lhs + zone.rhs;
 }
 
 // read an i32 from anywhere in guest memory. The host uses this to verify its out-of-band writes through the identity backing are guest-visible
