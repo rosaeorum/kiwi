@@ -1,8 +1,35 @@
-pub fn build(b: *Build) !void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+var is_windows: bool = undefined;
+var target: Build.ResolvedTarget = undefined;
+var wasm_target: Build.ResolvedTarget = undefined;
+var optimize: base.zig_builtin.Optimize = undefined;
 
-    const is_windows = target.result.os.tag == .windows;
+var zon_version: base.SemanticVersion = undefined;
+
+var translate_c_dep: *Build.Dependency = undefined;
+var vulkan_headers: *Build.Dependency = undefined;
+var vulkan_dep: *Build.Dependency = undefined;
+var vma_dep: *Build.Dependency = undefined;
+var wasmtime_dep: *Build.Dependency = undefined;
+
+var glfw_lib: *Build.Step.Compile = undefined;
+var vma_lib: *Build.Step.Compile = undefined;
+var spv_patcher: *Build.Step.Compile = undefined;
+var wasmtime_lib_path: Build.LazyPath = undefined;
+var static_config: *Build.Step.Options = undefined;
+
+pub fn build(b: *Build) !void {
+    const check_step = b.step("check", "Run semantic analysis");
+    const test_step = b.step("test", "Run unit tests");
+
+    target = b.standardTargetOptions(.{});
+    wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_features_add = base.Target.wasm.featureSet(&.{.simd128}),
+    });
+    optimize = b.standardOptimizeOption(.{});
+
+    is_windows = target.result.os.tag == .windows;
 
     var zon_diag = zon.parse.Diagnostics{};
     const zon_data = zon.parse.fromSliceAlloc(
@@ -17,202 +44,135 @@ pub fn build(b: *Build) !void {
             .{zon_diag},
         );
     };
-    const zon_version = base.SemanticVersion.parse(zon_data.version) catch |err| {
+
+    zon_version = base.SemanticVersion.parse(zon_data.version) catch |err| {
         debug.panic(
             "Failed to parse build.zig.zon version: {s}\n",
             .{@errorName(err)},
         );
     };
 
-    const vulkan_headers = b.dependency("vulkan_headers", .{});
-    const vulkan_dep = b.dependency("vulkan", .{
+    translate_c_dep = b.dependency("translate_c", .{});
+    vulkan_headers = b.dependency("vulkan_headers", .{});
+    vulkan_dep = b.dependency("vulkan", .{
         .target = b.graph.host,
         .optimize = .safe,
     });
-
-    const vulkan_bindgen = vulkan_dep.artifact("vulkan-zig-generator");
-    const vulkan_bindgen_run = b.addRunArtifact(vulkan_bindgen);
-
-    vulkan_bindgen_run.addFileArg2(vulkan_headers.path("registry/vk.xml"), .{});
-    const vulkan_bindings = vulkan_bindgen_run.addOutputFileArg2("vulkan.zig", .{});
-
-    const write_vulkan_bindings_source = b.addUpdateSourceFiles();
-    write_vulkan_bindings_source.addCopyFileToSource(vulkan_bindings, "src/module/vulkan.zig");
-
-    const vk_bindgen_step = b.step("gen-vk", "run vulkan-zig-generator to update src/module/vulkan.zig");
-    vk_bindgen_step.dependOn(&write_vulkan_bindings_source.step);
-
-    const wasmtime_dep = try if (is_windows)
+    vma_dep = b.dependency("vma", .{});
+    wasmtime_dep = try if (is_windows)
         b.dependencyLazy("wasmtime_mingw", .{})
     else
         b.dependencyLazy("wasmtime_linux", .{});
-    const wasmtime_include = wasmtime_dep.path("include");
-    const wasmtime_lib_path = wasmtime_dep.path("lib/");
 
-    const translate_c_dep = b.dependency("translate_c", .{});
-    const t = Translator.init(translate_c_dep, .{
-        .c_source_file = b.addWriteFiles().add(
-            "wasm.c",
-            \\#include "wasm.h"
-            \\#include "wasi.h"
-            \\#include "wasmtime.h"
-            ,
-        ),
-        .target = target,
-        .optimize = optimize,
+    glfw_lib = buildGlfw(b);
+    vma_lib = buildVk(b);
+    spv_patcher = buildSpvPatcher(b);
+    wasmtime_lib_path = buildWasmtime(b);
+    static_config = buildStaticConfig(b);
+
+    const kiwi_mod = createModule(b, "kiwi", b.path("src/module/kiwi.zig"));
+    const driver_mod = createModule(b, null, b.path("src/driver.zig"));
+    const runtime_test_mod = createModule(b, null, b.path("src/runtime_test.zig"));
+
+    const kiwi_test = b.addTest(.{
+        .root_module = kiwi_mod,
+        .use_lld = true,
+        .use_llvm = true,
     });
-
-    t.defineCMacro("WASM_API_EXTERN", "");
-    t.defineCMacro("WASI_API_EXTERN", "");
-
-    t.addIncludePath(wasmtime_include);
-
-    const wasmtime_bindings = t.output_file;
-
-    const write_wasm_bindings_source = b.addUpdateSourceFiles();
-    write_wasm_bindings_source.addCopyFileToSource(wasmtime_bindings, "src/module/wasm.zig");
-
-    const wasm_bindgen_step = b.step("gen-wasm", "run translate-c to update src/module/wasmtime.zig");
-    wasm_bindgen_step.dependOn(&write_wasm_bindings_source.step);
-
-    const glfw_lib = buildGlfw(b, target, optimize, vulkan_headers, translate_c_dep);
-    const vma_lib = buildVma(b, target, optimize);
-
-    const static_config = b.addOptions();
-
-    static_config.addOption(base.SemanticVersion, "engine_version", zon_version);
-
-    inline for (comptime base.meta.declarations(config)) |prop_name| {
-        const prop = @field(config, prop_name);
-
-        static_config.addOption(
-            prop.type,
-            prop_name,
-            @min(
-                @max(
-                    b.option(
-                        prop.type,
-                        prop_name,
-                        b.fmt(
-                            prop.description ++ "default: {d}, min: {d}, max: {d}",
-                            .{ prop.default, prop.min, prop.max },
-                        ),
-                    ) orelse prop.default,
-                    prop.min,
-                ),
-                prop.max,
-            ),
-        );
-    }
-
-    const kiwi_mod = b.addModule("kiwi", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/module/kiwi.zig"),
-        .link_libc = true,
-        .link_libcpp = true,
-    });
-
-    kiwi_mod.addOptions("static_config", static_config);
-    kiwi_mod.linkLibrary(glfw_lib);
-    kiwi_mod.linkLibrary(vma_lib);
-    kiwi_mod.addLibraryPath(wasmtime_lib_path);
-    kiwi_mod.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static });
-    kiwi_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
-    kiwi_mod.addImport("helpers", translate_c_dep.module("helpers"));
-
-    const kiwi_test = b.addTest(.{ .root_module = kiwi_mod });
-
-    const check_step = b.step("check", "Run semantic analysis");
     check_step.dependOn(&kiwi_test.step);
-
     const kiwi_test_run = b.addRunArtifact(kiwi_test);
-    const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&kiwi_test_run.step);
 
-    const driver_mod = b.createModule(.{
-        .root_source_file = b.path("src/driver.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .link_libcpp = true,
-    });
-
-    driver_mod.addOptions("static_config", static_config);
-    driver_mod.linkLibrary(glfw_lib);
-    driver_mod.linkLibrary(vma_lib);
-    driver_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
-    driver_mod.addImport("helpers", translate_c_dep.module("helpers"));
-
-    appendStatic(driver_mod);
+    // NOTE: there is a bug on linux where static linking wasmtime fails under self hosted linker; must use lld for now
 
     const driver_exe = b.addExecutable(.{
         .name = "driver",
         .root_module = driver_mod,
+        .use_lld = true,
+        .use_llvm = true,
     });
-
     check_step.dependOn(&driver_exe.step);
     test_step.dependOn(&driver_exe.step);
-
     b.installArtifact(driver_exe);
 
     const driver_run = b.addRunArtifact(driver_exe);
-    const run_step = b.step("run", "Run the driver");
-    run_step.dependOn(&driver_run.step);
+    const run_driver_step = b.step("run-driver", "Run the driver");
+    run_driver_step.dependOn(&driver_run.step);
 
-    const memswap_poc_mod = b.createModule(.{
-        .root_source_file = b.path("src/memswap-poc.zig"),
+    const runtime_test = b.addTest(.{
+        .root_module = runtime_test_mod,
+        .use_lld = true,
+        .use_llvm = true,
+    });
+    check_step.dependOn(&runtime_test.step);
+    const runtime_test_run = b.addRunArtifact(runtime_test);
+    test_step.dependOn(&runtime_test_run.step);
+
+    const runtime_test_bench = b.addExecutable(.{
+        .name = "runtime_test",
+        .root_module = runtime_test_mod,
+        .use_lld = true,
+        .use_llvm = true,
+    });
+    check_step.dependOn(&runtime_test_bench.step);
+    test_step.dependOn(&runtime_test_bench.step);
+    b.installArtifact(runtime_test_bench);
+
+    const bench_run = b.addRunArtifact(runtime_test_bench);
+    const run_bench_step = b.step("run-bench", "Run the runtime benchmark");
+    run_bench_step.dependOn(&bench_run.step);
+}
+
+fn createModule(b: *Build, pub_name: ?[]const u8, root_src_file: Build.LazyPath) *Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = root_src_file,
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .link_libcpp = true,
     });
 
-    memswap_poc_mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
-    memswap_poc_mod.addImport("helpers", translate_c_dep.module("helpers"));
+    if (pub_name) |name| {
+        const graph = b.graph;
+        const arena = graph.arena;
+        const gop = b.modules.getOrPutValue(
+            arena,
+            graph.dupeString(name),
+            mod,
+        ) catch @panic("OOM");
+        base.debug.assert(!gop.found_existing);
+    }
 
-    const memswap_guest_src_write = b.addWriteFiles();
-    const memswap_guest_src = memswap_guest_src_write.add("memswap_poc_guest.zig", memswap_poc.guest_src);
-    const memswap_guest_wasm = addZigScript(b, "memswap_poc_guest", memswap_guest_src);
-    memswap_poc_mod.addAnonymousImport("guest.wasm", .{ .root_source_file = memswap_guest_wasm });
-
-    memswap_poc_mod.addLibraryPath(wasmtime_lib_path);
-    memswap_poc_mod.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static });
+    mod.linkLibrary(glfw_lib);
+    mod.linkLibrary(vma_lib);
+    mod.addLibraryPath(wasmtime_lib_path);
+    mod.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static });
     if (is_windows) {
         const win_deps: []const []const u8 = &.{ "ws2_32", "advapi32", "userenv", "ntdll", "shell32", "ole32", "bcrypt" };
         for (win_deps) |win_dep| {
-            memswap_poc_mod.linkSystemLibrary(win_dep, .{});
+            mod.linkSystemLibrary(win_dep, .{});
         }
     } else {
         const nix_deps: []const []const u8 = &.{ "m", "dl", "pthread" };
         for (nix_deps) |nix_dep| {
-            memswap_poc_mod.linkSystemLibrary(nix_dep, .{});
+            mod.linkSystemLibrary(nix_dep, .{});
         }
     }
 
-    const memswap_poc_test = b.addTest(.{
-        .root_module = memswap_poc_mod,
-        // NOTE: there is a bug on linux where static linking wasmtime fails under self hosted
-        .use_lld = true,
-        .use_llvm = true,
-    });
+    mod.addOptions("static_config", static_config);
 
-    const memswap_poc_bench = b.addExecutable(.{
-        .name = "memswap_poc",
-        .root_module = memswap_poc_mod,
-        .use_lld = true,
-        .use_llvm = true,
-    });
+    mod.addImport("c_builtins", translate_c_dep.module("c_builtins"));
+    mod.addImport("helpers", translate_c_dep.module("helpers"));
 
-    b.installArtifact(memswap_poc_bench);
+    const runtime_guest_src_write = mod.owner.addWriteFiles();
+    const runtime_guest_a_src = runtime_guest_src_write.add("runtime_test_guest_a.zig", runtime_test_src.guest_a_src);
+    const runtime_guest_a_wasm = addZigScript(mod.owner, "runtime_test_guest_a", runtime_guest_a_src);
+    mod.addAnonymousImport("guest_a.wasm", .{ .root_source_file = runtime_guest_a_wasm });
 
-    const memswap_poc_test_run = b.addRunArtifact(memswap_poc_test);
+    const runtime_guest_b_src = runtime_guest_src_write.add("runtime_test_guest_b.zig", runtime_test_src.guest_b_src);
+    const runtime_guest_b_wasm = addZigScript(mod.owner, "runtime_test_guest_b", runtime_guest_b_src);
+    mod.addAnonymousImport("guest_b.wasm", .{ .root_source_file = runtime_guest_b_wasm });
 
-    check_step.dependOn(&memswap_poc_test.step);
-    test_step.dependOn(&memswap_poc_test_run.step);
-}
-
-fn appendStatic(mod: *Build.Module) void {
     mod.addAnonymousImport("vert.spv", .{
         .root_source_file = addZigShader(mod.owner, "vert", mod.owner.path("static/shader/min.zig"), false),
         //compileGlsl(mod.owner, mod.owner.path("static/shader/min.vert")),
@@ -226,6 +186,8 @@ fn appendStatic(mod: *Build.Module) void {
     mod.addAnonymousImport("image.png", .{
         .root_source_file = mod.owner.path("static/image/zig-mark.png"),
     });
+
+    return mod;
 }
 
 fn LazyPathMap(comptime V: type) type {
@@ -294,54 +256,53 @@ fn LazyPathMap(comptime V: type) type {
     );
 }
 
-var patcher: ?*Build.Step.Compile = null;
-
-fn spvPatcher(
-    b: *Build,
-) *Build.Step.Compile {
-    if (patcher == null) {
-        patcher = b.addExecutable(.{
-            .name = "spv_patch",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/spv_patch.zig"),
-                .target = b.graph.host,
-                .optimize = .debug,
-            }),
-        });
-    }
-    return patcher.?;
-}
+var zig_script_cache: LazyPathMap(Build.LazyPath) = .empty;
 
 fn addZigScript(
     b: *Build,
     name: []const u8,
     script_source: Build.LazyPath,
 ) Build.LazyPath {
-    const target = b.resolveTargetQuery(.{
-        .cpu_arch = .wasm32,
-        .os_tag = .freestanding,
-        .cpu_features_add = base.Target.wasm.featureSet(&.{.simd128}),
+    const gop = zig_script_cache.getOrPut(b.allocator, script_source) catch @panic("OOM");
+
+    if (!gop.found_existing) {
+        const shader_mod = b.createModule(.{
+            .root_source_file = script_source,
+            .target = wasm_target,
+            .optimize = .fast,
+        });
+
+        const script_obj = b.addExecutable(.{
+            .name = name,
+            .root_module = shader_mod,
+            .use_llvm = true,
+            .use_lld = true,
+        });
+
+        script_obj.entry = .disabled;
+        script_obj.rdynamic = true;
+
+        b.installArtifact(script_obj);
+
+        gop.value_ptr.* = script_obj.getEmittedBin();
+    }
+
+    return gop.value_ptr.*;
+}
+
+var zig_shader_cache: LazyPathMap(struct { frag: ?Build.LazyPath, vert: ?Build.LazyPath }) = .empty;
+
+fn buildSpvPatcher(
+    b: *Build,
+) *Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "spv_patch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spv_patch.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
     });
-
-    const shader_mod = b.createModule(.{
-        .root_source_file = script_source,
-        .target = target,
-        .optimize = .fast,
-    });
-
-    const script_obj = b.addExecutable(.{
-        .name = name,
-        .root_module = shader_mod,
-        .use_llvm = true,
-        .use_lld = true,
-    });
-
-    script_obj.entry = .disabled;
-    script_obj.rdynamic = true;
-
-    b.installArtifact(script_obj);
-
-    return script_obj.getEmittedBin();
 }
 
 fn addZigShader(
@@ -350,6 +311,15 @@ fn addZigShader(
     shader_source: Build.LazyPath,
     is_fragment: bool,
 ) Build.LazyPath {
+    const gop = zig_shader_cache.getOrPut(b.allocator, shader_source) catch @panic("OOM");
+
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .frag = null, .vert = null };
+    }
+
+    if (is_fragment and gop.value_ptr.frag != null) return gop.value_ptr.frag.?;
+    if (!is_fragment and gop.value_ptr.vert != null) return gop.value_ptr.vert.?;
+
     const options = b.addOptions();
     options.addOption(bool, "is_fragment", is_fragment);
 
@@ -371,9 +341,15 @@ fn addZigShader(
         .use_lld = false,
     });
 
-    const patch_run = b.addRunArtifact(spvPatcher(b));
+    const patch_run = b.addRunArtifact(spv_patcher);
     patch_run.addArtifactArg2(shader_obj, .{});
     const patched_spv = patch_run.addOutputFileArg(b.fmt("{s}_patched.spv", .{name}));
+
+    if (is_fragment) {
+        gop.value_ptr.frag = patched_spv;
+    } else {
+        gop.value_ptr.vert = patched_spv;
+    }
 
     return patched_spv;
 }
@@ -399,10 +375,68 @@ fn compileGlsl(b: *Build, source: Build.LazyPath) Build.LazyPath {
     return gop.value_ptr.*;
 }
 
-fn buildVma(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode) *Build.Step.Compile {
-    const vma_dep = b.dependency("vma", .{});
-    const vulkan_headers = b.dependency("vulkan_headers", .{});
+fn buildStaticConfig(b: *Build) *Build.Step.Options {
+    const conf = b.addOptions();
+    conf.addOption(base.SemanticVersion, "engine_version", zon_version);
 
+    inline for (comptime base.meta.declarations(config)) |prop_name| {
+        const prop = @field(config, prop_name);
+
+        conf.addOption(
+            prop.type,
+            prop_name,
+            @min(
+                @max(
+                    b.option(
+                        prop.type,
+                        prop_name,
+                        b.fmt(
+                            prop.description ++ "default: {d}, min: {d}, max: {d}",
+                            .{ prop.default, prop.min, prop.max },
+                        ),
+                    ) orelse prop.default,
+                    prop.min,
+                ),
+                prop.max,
+            ),
+        );
+    }
+
+    return conf;
+}
+
+fn buildWasmtime(b: *Build) Build.LazyPath {
+    const wasmtime_include = wasmtime_dep.path("include");
+
+    const t = Translator.init(translate_c_dep, .{
+        .c_source_file = b.addWriteFiles().add(
+            "wasm.c",
+            \\#include "wasm.h"
+            \\#include "wasi.h"
+            \\#include "wasmtime.h"
+            ,
+        ),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    t.defineCMacro("WASM_API_EXTERN", "");
+    t.defineCMacro("WASI_API_EXTERN", "");
+
+    t.addIncludePath(wasmtime_include);
+
+    const wasmtime_bindings = t.output_file;
+
+    const write_wasm_bindings_source = b.addUpdateSourceFiles();
+    write_wasm_bindings_source.addCopyFileToSource(wasmtime_bindings, "src/module/wasm.zig");
+
+    const wasm_bindgen_step = b.step("gen-wasm", "run translate-c to update src/module/wasmtime.zig");
+    wasm_bindgen_step.dependOn(&write_wasm_bindings_source.step);
+
+    return wasmtime_dep.path("lib/");
+}
+
+fn buildVk(b: *Build) *Build.Step.Compile {
     const lib = b.addLibrary(.{
         .name = "vma",
         .root_module = b.createModule(.{
@@ -422,10 +456,22 @@ fn buildVma(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode) *Bu
         .language = .cpp,
     });
 
+    const vulkan_bindgen = vulkan_dep.artifact("vulkan-zig-generator");
+    const vulkan_bindgen_run = b.addRunArtifact(vulkan_bindgen);
+
+    vulkan_bindgen_run.addFileArg2(vulkan_headers.path("registry/vk.xml"), .{});
+    const vulkan_bindings = vulkan_bindgen_run.addOutputFileArg2("vulkan.zig", .{});
+
+    const write_vulkan_bindings_source = b.addUpdateSourceFiles();
+    write_vulkan_bindings_source.addCopyFileToSource(vulkan_bindings, "src/module/vulkan.zig");
+
+    const vk_bindgen_step = b.step("gen-vk", "run vulkan-zig-generator to update src/module/vulkan.zig");
+    vk_bindgen_step.dependOn(&write_vulkan_bindings_source.step);
+
     return lib;
 }
 
-fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vulkan_headers: *Build.Dependency, translate_c_dep: *Build.Dependency) *Build.Step.Compile {
+fn buildGlfw(b: *Build) *Build.Step.Compile {
     const base_sources = [_][]const u8{
         "context.c",
         "egl_context.c",
@@ -568,7 +614,7 @@ fn buildGlfw(b: *Build, target: Build.ResolvedTarget, optimize: OptimizeMode, vu
     return lib;
 }
 
-const memswap_poc = @import("src/memswap-poc.zig");
+const runtime_test_src = @import("src/runtime_test.zig");
 const Translator = @import("translate_c").Translator;
 const base = @import("src/module/base.zig");
 const zon = base.zon;

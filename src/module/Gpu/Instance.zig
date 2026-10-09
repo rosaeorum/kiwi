@@ -107,7 +107,7 @@ pub fn init(
         .pp_enabled_layer_names = &[_][*:0]const u8{"VK_LAYER_KHRONOS_validation"},
     }, null) catch |err| retry: switch (err) {
         error.LayerNotPresent => {
-            log.warn("Debug layer not available, trying to create Instance without...", .{});
+            log.info("Debug layer not available, trying to create Instance without...", .{});
             break :retry try self.base_wrapper.createInstance(&.{
                 .p_application_info = &app_info,
 

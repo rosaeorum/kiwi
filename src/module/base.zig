@@ -968,4 +968,11 @@ pub fn sentinel(comptime T: type) T {
     return math.maxInt(T);
 }
 
+pub fn fatal(comptime msg: []const u8, args: anytype) noreturn {
+    @branchHint(.cold);
+    log.debug("FIXME: use norecover", .{});
+    log.err("fatal: " ++ msg ++ "\n", args);
+    std.process.exit(1);
+}
+
 const std = @import("std");
