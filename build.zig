@@ -320,6 +320,7 @@ fn addZigScript(
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
+        .cpu_features_add = base.Target.wasm.featureSet(&.{ .simd128, .relaxed_simd }),
     });
 
     const shader_mod = b.createModule(.{
@@ -331,8 +332,8 @@ fn addZigScript(
     const script_obj = b.addExecutable(.{
         .name = name,
         .root_module = shader_mod,
-        .use_llvm = false,
-        .use_lld = false,
+        .use_llvm = true,
+        .use_lld = true,
     });
 
     script_obj.entry = .disabled;

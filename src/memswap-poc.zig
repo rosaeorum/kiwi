@@ -665,6 +665,7 @@ const Engine = struct {
         c.wasmtime_config_memory_reservation_set(config, wasm_region_size);
         c.wasmtime_config_memory_guard_size_set(config, wasm_region_size);
         c.wasmtime_config_memory_may_move_set(config, false);
+        c.wasmtime_config_wasm_simd_set(config, true);
         const engine = c.wasm_engine_new_with_config(config) orelse return error.EngineNewFailed;
         errdefer c.wasm_engine_delete(engine);
 
