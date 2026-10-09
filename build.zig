@@ -176,15 +176,6 @@ pub fn build(b: *Build) !void {
     const memswap_guest_wasm = addZigScript(b, "memswap_poc_guest", memswap_guest_src);
     memswap_poc_mod.addAnonymousImport("guest.wasm", .{ .root_source_file = memswap_guest_wasm });
 
-    const memswap_poc_test = b.addTest(.{
-        .root_module = memswap_poc_mod,
-        // NOTE: there is a bug on linux where static linking wasmtime fails under self hosted
-        .use_lld = true,
-        .use_llvm = true,
-    });
-
-    const memswap_poc_test_run = b.addRunArtifact(memswap_poc_test);
-
     memswap_poc_mod.addLibraryPath(wasmtime_lib_path);
     memswap_poc_mod.linkSystemLibrary("wasmtime", .{ .preferred_link_mode = .static });
     if (is_windows) {
@@ -198,6 +189,24 @@ pub fn build(b: *Build) !void {
             memswap_poc_mod.linkSystemLibrary(nix_dep, .{});
         }
     }
+
+    const memswap_poc_test = b.addTest(.{
+        .root_module = memswap_poc_mod,
+        // NOTE: there is a bug on linux where static linking wasmtime fails under self hosted
+        .use_lld = true,
+        .use_llvm = true,
+    });
+
+    const memswap_poc_bench = b.addExecutable(.{
+        .name = "memswap_poc",
+        .root_module = memswap_poc_mod,
+        .use_lld = true,
+        .use_llvm = true,
+    });
+
+    b.installArtifact(memswap_poc_bench);
+
+    const memswap_poc_test_run = b.addRunArtifact(memswap_poc_test);
 
     check_step.dependOn(&memswap_poc_test.step);
     test_step.dependOn(&memswap_poc_test_run.step);

@@ -12,8 +12,17 @@ const log = std.log.scoped(.wasm);
 
 const wasm_page_size: usize = 64 * 1024;
 const wasm_region_size: usize = 1 << 32;
-const swap_zone_size: usize = wasm_page_size * 16;
-const swap_zone_base_offset: usize = wasm_region_size - swap_zone_size;
+
+const binding_slot_size: usize = 1 << 20; // 1 MiB
+const max_binding_slots: usize = 8;
+const total_binding_region: usize = binding_slot_size * max_binding_slots; // 8 MiB
+const binding_region_base: usize = wasm_region_size - total_binding_region; // 0xFF800000
+const swap_zone_base_offset: usize = binding_region_base + (max_binding_slots - 1) * binding_slot_size;
+const swap_zone_size: usize = binding_slot_size;
+
+const Position = extern struct { x: f32, y: f32 };
+const Velocity = extern struct { x: f32, y: f32 };
+const Health = extern struct { current: i32 };
 
 pub const guest_src: []const u8 =
     std.fmt.comptimePrint(
@@ -21,55 +30,64 @@ pub const guest_src: []const u8 =
         \\pub const ZONE_ADDR: usize = 0x{x};
         \\pub const ZONE_LEN: usize = 0x{x};
     , .{ swap_zone_base_offset, swap_zone_size }) ++
-    // the host swap zone, as the guest sees it: one fixed []u8 window
     \\pub fn zoneBytes() []u8 {
     \\    const p: [*]u8 = @ptrFromInt(ZONE_ADDR);
     \\    return p[0..ZONE_LEN];
     \\}
-    // stand-in for an ecs system, operates on swapped zone data as bytes
     \\export fn add() void {
     \\    const z = zoneBytes();
     \\    const lhs = std.mem.readInt(i32, z[0..4], .little);
     \\    const rhs = std.mem.readInt(i32, z[4..8], .little);
     \\    std.mem.writeInt(i32, z[0..4], lhs + rhs, .little);
     \\}
-    // read an i32 from anywhere in guest memory
-    // the host uses this to verify its out-of-band writes through the identity backing are guest-visible
     \\export fn echo(addr: u32) i32 {
     \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
     \\    return p.*;
     \\}
-    // write an i32 anywhere in guest memory
-    // the host verifies it out-of-band
     \\export fn poke(addr: u32, val: i32) void {
     \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, addr));
     \\    p.* = val;
     \\}
-    // grow linear memory by `pages` pages;
-    // 0 on success, -1 (per wasm spec) if the host refuses; e.g. growing into the swap zone
     \\export fn grow(pages: u32) i32 {
     \\    if (@wasmMemoryGrow(0, pages) != -1) return 0;
     \\    return -1;
     \\}
-    // tests guest's own data section
     \\export var scratch: [3]i32 = .{ 0, 0, 0 };
     \\export fn scratchAddr(idx: u32) u32 {
     \\    return @intCast(@intFromPtr(&scratch[idx]));
     \\}
-    // zone reachability via BOTH addressing forms, so a wasmtime config or
-    // regression that reintroduces current-size bounds checks fails the suite
-    \\export fn zoneLoadStatic() i32 { // folds to: i32.load offset=0xFFFF0000
+    \\export fn zoneLoadStatic() i32 {
     \\    const p: *align(1) i32 = @ptrFromInt(ZONE_ADDR);
     \\    return p.*;
     \\}
-    // test runtime pointer in the index register
     \\export fn zonePokeDynamic(base: u32, val: i32) void {
     \\    const p: *align(1) i32 = @ptrFromInt(@as(usize, base));
     \\    p.* = val;
     \\}
-    // returns memory.size exactly as the JIT sees it
     \\export fn memPages() u32 {
     \\    return @wasmMemorySize(0);
+    \\}
+    \\pub const Position = extern struct { x: f32, y: f32 };
+    \\pub const Velocity = extern struct { x: f32, y: f32 };
+    \\pub const Health = extern struct { current: i32 };
+    \\export fn particle_system(
+    \\    pos_addr: i32,
+    \\    vel_addr: i32,
+    \\    health_addr: i32,
+    \\    count: i32,
+    \\    flags: i32,
+    \\) void {
+    \\    const positions: [*]Position = @ptrFromInt(@as(usize, @bitCast(pos_addr)));
+    \\    const velocities: [*]Velocity = @ptrFromInt(@as(usize, @bitCast(vel_addr)));
+    \\    var i: usize = 0;
+    \\    while (i < @as(usize, @intCast(count))) : (i += 1) {
+    \\        positions[i].x += velocities[i].x;
+    \\        positions[i].y += velocities[i].y;
+    \\        if ((flags & 1) != 0) {
+    \\            const healths: [*]Health = @ptrFromInt(@as(usize, @bitCast(health_addr)));
+    \\            if (healths[i].current > 0) healths[i].current -= 1;
+    \\        }
+    \\    }
     \\}
     ;
 
@@ -77,13 +95,24 @@ fn i32At(base: [*]u8, off: usize) *align(1) i32 {
     return @ptrCast(base + off);
 }
 
-/// host alias of the swap zone inside the guest's linear-memory reservation;
-/// whatever blob is swapped in is directly reachable through this view
 fn zoneView(base: [*]u8) []u8 {
     return (base + swap_zone_base_offset)[0..swap_zone_size];
 }
 
-/// typed access only through byte views; wasm linear memory is little-endian
+fn bindingView(base: [*]u8) []u8 {
+    return (base + binding_region_base)[0..total_binding_region];
+}
+
+fn slotView(base: [*]u8, slot: usize) []u8 {
+    std.debug.assert(slot < max_binding_slots);
+    return (base + binding_region_base + slot * binding_slot_size)[0..binding_slot_size];
+}
+
+fn slotAddr(slot: usize) i32 {
+    std.debug.assert(slot < max_binding_slots);
+    return @bitCast(@as(u32, @intCast(binding_region_base + slot * binding_slot_size)));
+}
+
 fn getI32(view: []const u8, idx: usize) i32 {
     return std.mem.readInt(i32, view[idx * 4 ..][0..4], .little);
 }
@@ -186,8 +215,8 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn reserveSpan(st: *State, span: usize) ?[*]u8 {
-            st.guest_section = makeFileSection(swap_zone_base_offset) orelse return null;
-            st.zero_section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, 0, @truncate(swap_zone_size), null);
+            st.guest_section = makeFileSection(binding_region_base) orelse return null;
+            st.zero_section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, 0, @truncate(binding_slot_size), null);
             if (st.zero_section == null) {
                 _ = CloseHandle(st.guest_section.?);
                 st.* = .{};
@@ -221,11 +250,21 @@ const Platform = switch (builtin.os.tag) {
             return mapSectionView(st.zero_section.?, zone.ptr, 0, zone.len);
         }
 
-        pub const Blob = struct { section: HANDLE, len: usize };
+        pub fn commitBindingRegion(st: *State, region: []u8) bool {
+            _ = st;
+            var i: usize = 0;
+            while (i < max_binding_slots) : (i += 1) {
+                const slot_ptr = region.ptr + i * binding_slot_size;
+                if (!splitPlaceholder(slot_ptr, binding_slot_size)) return false;
+            }
+            return true;
+        }
+
+        pub const Blob = struct { section: HANDLE, len: usize, offset: usize = 0 };
 
         pub fn blobCreate(len: usize) ?Blob {
             const section = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, @truncate(len >> 32), @truncate(len), null) orelse return null;
-            return .{ .section = section, .len = len };
+            return .{ .section = section, .len = len, .offset = 0 };
         }
 
         pub fn blobDestroy(blob: Blob) void {
@@ -233,7 +272,7 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn blobMap(blob: Blob) ?[]u8 {
-            const v = MapViewOfFile(blob.section, FILE_MAP_ALL_ACCESS, 0, 0, 0) orelse return null;
+            const v = MapViewOfFile(blob.section, FILE_MAP_ALL_ACCESS, @truncate(blob.offset >> 32), @truncate(blob.offset), blob.len) orelse return null;
             const p: [*]u8 = @ptrCast(v);
             return p[0..blob.len];
         }
@@ -245,11 +284,11 @@ const Platform = switch (builtin.os.tag) {
         pub fn blobSwapIn(zone: []u8, blob: Blob) bool {
             std.debug.assert(blob.len <= zone.len);
             _ = UnmapViewOfFileEx.?(@ptrCast(zone.ptr), MEM_PRESERVE_PLACEHOLDER);
-            return mapSectionView(blob.section, zone.ptr, 0, blob.len);
+            return mapSectionView(blob.section, zone.ptr, blob.offset, blob.len);
         }
 
         fn guestAccess(st: *State, guest_off: usize, write: bool, val: i32) i32 {
-            std.debug.assert(guest_off + 4 <= swap_zone_base_offset);
+            std.debug.assert(guest_off + 4 <= binding_region_base);
             const map_off = guest_off & ~(wasm_page_size - 1);
             const v = MapViewOfFile(st.guest_section, FILE_MAP_ALL_ACCESS, @truncate(map_off >> 32), @truncate(map_off), (guest_off + 4) - map_off) orelse fatal("MapViewOfFile scratch", .{});
             defer _ = UnmapViewOfFile(v);
@@ -271,7 +310,8 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn zonePark(zone: []u8) bool {
-            return UnmapViewOfFileEx.?(@ptrCast(zone.ptr), MEM_PRESERVE_PLACEHOLDER) != 0;
+            _ = UnmapViewOfFileEx.?(@ptrCast(zone.ptr), MEM_PRESERVE_PLACEHOLDER);
+            return true;
         }
 
         pub fn zoneUnpark(st: *State, zone: []u8) bool {
@@ -312,7 +352,7 @@ const Platform = switch (builtin.os.tag) {
             const base = mmapOk(null, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return null;
             const fd = memfd_create("wzs-guest", 0);
             if (fd < 0) return null;
-            if (ftruncate(fd, @intCast(swap_zone_base_offset)) != 0) {
+            if (ftruncate(fd, @intCast(binding_region_base)) != 0) {
                 _ = close(fd);
                 return null;
             }
@@ -329,7 +369,12 @@ const Platform = switch (builtin.os.tag) {
             return mmapOk(@ptrCast(zone.ptr), zone.len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
 
-        pub const Blob = struct { fd: c_int, len: usize };
+        pub fn commitBindingRegion(st: *State, region: []u8) bool {
+            _ = st;
+            return mmapOk(@ptrCast(region.ptr), region.len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
+        }
+
+        pub const Blob = struct { fd: c_int, len: usize, offset: usize = 0 };
 
         pub fn blobCreate(len: usize) ?Blob {
             const fd = memfd_create("wzs-blob", 0);
@@ -338,7 +383,7 @@ const Platform = switch (builtin.os.tag) {
                 _ = close(fd);
                 return null;
             }
-            return .{ .fd = fd, .len = len };
+            return .{ .fd = fd, .len = len, .offset = 0 };
         }
 
         pub fn blobDestroy(blob: Blob) void {
@@ -346,7 +391,7 @@ const Platform = switch (builtin.os.tag) {
         }
 
         pub fn blobMap(blob: Blob) ?[]u8 {
-            const p = mmapOk(null, blob.len, PROT_READ | PROT_WRITE, MAP_SHARED, blob.fd, 0) orelse return null;
+            const p = mmapOk(null, blob.len, PROT_READ | PROT_WRITE, MAP_SHARED, blob.fd, @intCast(blob.offset)) orelse return null;
             const q: [*]u8 = @ptrCast(p);
             return q[0..blob.len];
         }
@@ -357,7 +402,7 @@ const Platform = switch (builtin.os.tag) {
 
         pub fn blobSwapIn(zone: []u8, blob: Blob) bool {
             std.debug.assert(blob.len <= zone.len);
-            if (mmapOk(@ptrCast(zone.ptr), blob.len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, blob.fd, 0) == null) return false;
+            if (mmapOk(@ptrCast(zone.ptr), blob.len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, blob.fd, @intCast(blob.offset)) == null) return false;
             if (blob.len == zone.len) return true;
             return mmapOk(@ptrCast(zone.ptr + blob.len), zone.len - blob.len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != null;
         }
@@ -432,8 +477,8 @@ fn hostNewMemory(
         return c.wasmtime_error_new("host memory: reservation below 4gb; the fixed swap-zone ABI requires the full 4gb (check wasmtime memory_reservation config)");
     if (reservation + guard <= wasm_region_size)
         return c.wasmtime_error_new("host memory: reservation+guard not above 4gb; bounds-check elision is off and the swap zone would be unreachable (check memory_reservation/memory_guard_size config)");
-    if (minimum > swap_zone_base_offset)
-        return c.wasmtime_error_new("host memory: module memory larger than the guest region below the swap zone");
+    if (minimum > binding_region_base)
+        return c.wasmtime_error_new("host memory: module memory larger than the guest region below the binding region");
     const no_max = maximum == std.math.maxInt(usize);
     if (!no_max and maximum == minimum)
         return c.wasmtime_error_new("host memory: min == max makes this a static heap; declare a dynamic memory so the 4gb reservation (and the zone at 0xFFFF0000) is actually honored");
@@ -448,12 +493,12 @@ fn hostNewMemory(
         return c.wasmtime_error_new("host memory: span reservation failed");
     if (!Platform.commitGuestPages(&m.plat, base, 0, minimum))
         return c.wasmtime_error_new("host memory: guest pages commit failed");
-    if (!Platform.commitSwapZone(&m.plat, zoneView(base)))
-        return c.wasmtime_error_new("host memory: swap zone commit failed");
+    if (!Platform.commitBindingRegion(&m.plat, bindingView(base)))
+        return c.wasmtime_error_new("host memory: binding region commit failed");
 
     m.base = base;
     m.size = minimum;
-    m.capacity = swap_zone_base_offset;
+    m.capacity = binding_region_base;
     m.guard = guard;
 
     memory_ret.* = .{
@@ -505,6 +550,10 @@ fn call2(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32, b: i32) !void
     return callRaw(ctx, f, &[_]i32{ a, b }, &[_]i32{});
 }
 
+fn call5(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32, b: i32, cc: i32, d: i32, e: i32) !void {
+    return callRaw(ctx, f, &[_]i32{ a, b, cc, d, e }, &[_]i32{});
+}
+
 fn call0ret(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t) !i32 {
     var r: [1]i32 = undefined;
     try callRaw(ctx, f, &.{}, &r);
@@ -554,61 +603,137 @@ fn expectTrap(ctx: *c.wasmtime_context_t, f: c.wasmtime_func_t, a: i32) !void {
     return error.ExpectedTrap;
 }
 
-pub const std_options = std.Options{
-    .log_level = .debug,
+const ComponentColumn = struct {
+    blob: Platform.Blob,
+    element_size: usize,
+    count: usize,
+    total_bytes: usize,
+
+    fn init(element_size: usize, count: usize) ?ComponentColumn {
+        const raw_total = element_size * count;
+        const total_bytes = std.mem.alignForward(usize, raw_total, binding_slot_size);
+        const blob = Platform.blobCreate(total_bytes) orelse return null;
+        return .{
+            .blob = blob,
+            .element_size = element_size,
+            .count = count,
+            .total_bytes = total_bytes,
+        };
+    }
+
+    fn deinit(col: *ComponentColumn) void {
+        Platform.blobDestroy(col.blob);
+    }
+
+    fn map(col: *ComponentColumn) ?[]u8 {
+        return Platform.blobMap(col.blob);
+    }
+
+    fn unmap(view: []u8) void {
+        Platform.blobUnmap(view);
+    }
+
+    fn pageCount(col: *const ComponentColumn) usize {
+        return col.total_bytes / binding_slot_size;
+    }
+
+    fn pageBlob(col: *const ComponentColumn, page_idx: usize) Platform.Blob {
+        const offset = page_idx * binding_slot_size;
+        std.debug.assert(offset < col.total_bytes);
+        var blob = col.blob;
+        blob.offset = offset;
+        blob.len = binding_slot_size;
+        return blob;
+    }
+
+    fn bindSlot(col: *const ComponentColumn, slot: []u8, page_idx: usize) bool {
+        return Platform.blobSwapIn(slot, col.pageBlob(page_idx));
+    }
+};
+
+const Engine = struct {
+    engine: *c.wasm_engine_t,
+    store: *c.wasmtime_store_t,
+    ctx: *c.wasmtime_context_t,
+    module: *c.wasmtime_module_t,
+    instance: c.wasmtime_instance_t,
+
+    fn create() !Engine {
+        const config = c.wasm_config_new() orelse return error.ConfigNewFailed;
+        c.wasmtime_config_host_memory_creator_set(config, &memory_creator);
+        c.wasmtime_config_memory_init_cow_set(config, false);
+        c.wasmtime_config_memory_reservation_set(config, wasm_region_size);
+        c.wasmtime_config_memory_guard_size_set(config, wasm_region_size);
+        c.wasmtime_config_memory_may_move_set(config, false);
+        const engine = c.wasm_engine_new_with_config(config) orelse return error.EngineNewFailed;
+        errdefer c.wasm_engine_delete(engine);
+
+        const store = c.wasmtime_store_new(engine, null, null) orelse return error.StoreNewFailed;
+        errdefer c.wasmtime_store_delete(store);
+        const ctx = c.wasmtime_store_context(store) orelse return error.StoreContextFailed;
+
+        var module: ?*c.wasmtime_module_t = null;
+        if (c.wasmtime_module_new(engine, guest_wasm.ptr, guest_wasm.len, &module)) |e| return dieError(e);
+        errdefer c.wasmtime_module_delete(module.?);
+
+        var instance: c.wasmtime_instance_t = undefined;
+        {
+            var trap: ?*c.wasm_trap_t = null;
+            var no_imports: [1]c.wasmtime_extern_t = undefined;
+            if (c.wasmtime_instance_new(ctx, module.?, &no_imports, 0, &instance, &trap)) |e| return dieError(e);
+            if (trap) |t| return dieTrap(t);
+        }
+
+        return .{
+            .engine = engine,
+            .store = store,
+            .ctx = ctx,
+            .module = module.?,
+            .instance = instance,
+        };
+    }
+
+    fn destroy(self: *Engine) void {
+        c.wasmtime_module_delete(self.module);
+        c.wasmtime_store_delete(self.store);
+        c.wasm_engine_delete(self.engine);
+    }
 };
 
 test {
     Platform.init();
 
-    const config = c.wasm_config_new() orelse return error.ConfigNewFailed;
-    c.wasmtime_config_host_memory_creator_set(config, &memory_creator);
-    c.wasmtime_config_memory_init_cow_set(config, false); // #10740
-    c.wasmtime_config_memory_reservation_set(config, wasm_region_size); // defines the maximum size a 32-bit linear memory can grow into
-    c.wasmtime_config_memory_guard_size_set(config, wasm_region_size); // allows offsets spanning the entire addressable space to bypass explicit bounds checks
-    c.wasmtime_config_memory_may_move_set(config, false); // force wasmtime to treat the reservation as a hard ceiling
-    const engine = c.wasm_engine_new_with_config(config) orelse return error.EngineNewFailed;
-    defer c.wasm_engine_delete(engine);
+    var eng = try Engine.create();
+    defer eng.destroy();
+    const ctx = eng.ctx;
 
-    const store = c.wasmtime_store_new(engine, null, null) orelse return error.StoreNewFailed;
-    defer c.wasmtime_store_delete(store);
-    const ctx = c.wasmtime_store_context(store) orelse return error.StoreContextFailed;
-
-    var module: ?*c.wasmtime_module_t = null;
-    if (c.wasmtime_module_new(engine, guest_wasm.ptr, guest_wasm.len, &module)) |e| return dieError(e);
-    defer c.wasmtime_module_delete(module);
-
-    var instance: c.wasmtime_instance_t = undefined;
-    {
-        var trap: ?*c.wasm_trap_t = null;
-        var no_imports: [1]c.wasmtime_extern_t = undefined;
-        if (c.wasmtime_instance_new(ctx, module, &no_imports, 0, &instance, &trap)) |e| return dieError(e);
-        if (trap) |t| return dieTrap(t);
-    }
-
-    const f_add = try getFunc(ctx, &instance, "add");
-    const f_echo = try getFunc(ctx, &instance, "echo");
-    const f_poke = try getFunc(ctx, &instance, "poke");
-    const f_grow = try getFunc(ctx, &instance, "grow");
-    const f_scratch = try getFunc(ctx, &instance, "scratchAddr");
-    const f_zoneLoadStatic = try getFunc(ctx, &instance, "zoneLoadStatic");
-    const f_zonePokeDynamic = try getFunc(ctx, &instance, "zonePokeDynamic");
-    const f_memPages = try getFunc(ctx, &instance, "memPages");
+    const f_add = try getFunc(ctx, &eng.instance, "add");
+    const f_echo = try getFunc(ctx, &eng.instance, "echo");
+    const f_poke = try getFunc(ctx, &eng.instance, "poke");
+    const f_grow = try getFunc(ctx, &eng.instance, "grow");
+    const f_scratch = try getFunc(ctx, &eng.instance, "scratchAddr");
+    const f_zoneLoadStatic = try getFunc(ctx, &eng.instance, "zoneLoadStatic");
+    const f_zonePokeDynamic = try getFunc(ctx, &eng.instance, "zonePokeDynamic");
+    const f_memPages = try getFunc(ctx, &eng.instance, "memPages");
+    const f_particle = try getFunc(ctx, &eng.instance, "particle_system");
 
     const base = host_mem.base orelse return error.HostMemoryNotCreated;
     const st = &host_mem.plat;
 
     log.debug("guest memory: base=0x{x} size={d} capacity={d} guard={d}", .{ @intFromPtr(base), host_mem.size, host_mem.capacity, host_mem.guard });
-    log.debug("swap zone: [0x{x}, 0x{x}) - fixed offset in every module", .{ swap_zone_base_offset, wasm_region_size });
+    log.debug("binding region: [0x{x}, 0x{x}) — {d} slots × {d} KiB", .{ binding_region_base, wasm_region_size, max_binding_slots, binding_slot_size / 1024 });
+    log.debug("swap zone (slot {d}): [0x{x}, 0x{x})", .{ max_binding_slots - 1, swap_zone_base_offset, swap_zone_base_offset + swap_zone_size });
 
+    // invariant: memory export base pointer matches host reservation
     {
         var item: c.wasmtime_extern_t = undefined;
-        if (c.wasmtime_instance_export_get(ctx, &instance, "memory", 6, &item)) {
+        if (c.wasmtime_instance_export_get(ctx, &eng.instance, "memory", 6, &item)) {
             if (item.kind != c.WASMTIME_EXTERN_MEMORY) return error.MemoryExportNotMemory;
             if (c.wasmtime_memory_data(ctx, &item.of.memory) != @as([*c]u8, @ptrCast(base))) return error.BasePointerMismatch;
         }
     }
 
+    // invariant: OOB host->guest and guest->host channels agree
     const scr0 = try call1ret(ctx, f_scratch, 0);
     const scr1 = try call1ret(ctx, f_scratch, 1);
 
@@ -625,6 +750,7 @@ test {
     if (seen_b != val_b) return error.OobGuestToHostFailed;
     if (i32At(base, @intCast(scr1)).* != val_b) return error.OobChannelsDisagree;
 
+    // invariant: memory growth works and fresh pages are identity-backed
     const size_before = host_mem.size;
     const grow_addr: i32 = @intCast(size_before + 0x40);
     if (try call1ret(ctx, f_grow, 2) != 0) return error.GrowFailed;
@@ -634,8 +760,9 @@ test {
     log.debug("[grow] +2 pages -> size={d}; fresh pages are identity-backed and both channels agree", .{host_mem.size});
 
     if (try call1ret(ctx, f_grow, 0x10000) != -1) return error.GrowShouldHaveFailed;
-    log.debug("[grow] refused to grow past the zone (returned -1, no trap)", .{});
+    log.debug("[grow] refused to grow past the binding region (returned -1, no trap)", .{});
 
+    // invariant: single-zone blob swap roundtrip
     const blob_a = Platform.blobCreate(swap_zone_size) orelse fatal("blobCreate(A)", .{});
     const blob_b = Platform.blobCreate(swap_zone_size) orelse fatal("blobCreate(B)", .{});
     defer Platform.blobDestroy(blob_a);
@@ -654,7 +781,7 @@ test {
     if (!Platform.blobSwapIn(zoneView(base), blob_a)) fatal("blobSwapIn(A)", .{});
     try call0(ctx, f_add);
     {
-        const zone = zoneView(base); // host alias of blob A's backing right now
+        const zone = zoneView(base);
         const sum = getI32(zone, 0);
         const a = Platform.blobMap(blob_a) orelse fatal("blobMap(A)", .{});
         defer Platform.blobUnmap(a);
@@ -673,6 +800,7 @@ test {
         if (sum != 12 or getI32(b, 0) != 12 or getI32(b, 1) != 5) return error.RoundtripBFailed;
     }
 
+    // invariant: swapped-out blob and guest data are intact
     {
         const a = Platform.blobMap(blob_a) orelse fatal("blobMap(A post-swap)", .{});
         defer Platform.blobUnmap(a);
@@ -685,6 +813,7 @@ test {
 
     log.debug("OK: zero-copy roundtrip complete", .{});
 
+    // invariant: out-of-bounds and parked-zone traps
     try expectTrap(ctx, f_echo, @intCast(host_mem.size + 0x1000));
     try expectTrap(ctx, f_echo, 0x7FFF_FFFC);
     try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(swap_zone_base_offset - 4))));
@@ -703,6 +832,7 @@ test {
 
     if (try call0ret(ctx, f_memPages) != host_mem.size / wasm_page_size) return error.MemSizeMismatch;
 
+    // invariant: static-offset and dynamic-index zone addressing
     const blob_test = Platform.blobCreate(swap_zone_size) orelse fatal("blobCreate(test)", .{});
     defer Platform.blobDestroy(blob_test);
     {
@@ -725,4 +855,380 @@ test {
     }
 
     log.debug("OK: both static-offset and dynamic-index zone addressing behave as expected.", .{});
+
+    const entity_count: usize = 1000;
+
+    var col_pos = ComponentColumn.init(@sizeOf(Position), entity_count) orelse fatal("col_pos init", .{});
+    var col_vel = ComponentColumn.init(@sizeOf(Velocity), entity_count) orelse fatal("col_vel init", .{});
+    var col_health = ComponentColumn.init(@sizeOf(Health), entity_count) orelse fatal("col_health init", .{});
+    defer col_pos.deinit();
+    defer col_vel.deinit();
+    defer col_health.deinit();
+
+    log.debug("[multi-bind] {d} entities, {d} pages/col (pos={}, vel={}, health={})", .{
+        entity_count,
+        col_pos.pageCount(),
+        col_pos.total_bytes,
+        col_vel.total_bytes,
+        col_health.total_bytes,
+    });
+
+    // initialise test data
+    {
+        const pv = col_pos.map() orelse fatal("col_pos map", .{});
+        defer ComponentColumn.unmap(pv);
+        const vv = col_vel.map() orelse fatal("col_vel map", .{});
+        defer ComponentColumn.unmap(vv);
+        const hv = col_health.map() orelse fatal("col_health map", .{});
+        defer ComponentColumn.unmap(hv);
+
+        const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+        const velocities: [*]Velocity = @ptrCast(@alignCast(vv.ptr));
+        const healths: [*]Health = @ptrCast(@alignCast(hv.ptr));
+
+        for (0..entity_count) |i| {
+            positions[i] = .{ .x = 0, .y = 0 };
+            velocities[i] = .{ .x = 1, .y = 2 };
+            healths[i] = .{ .current = 10 };
+        }
+    }
+
+    // dispatch with all three components (flags = 1, health present)
+    log.debug("[multi-bind] dispatch archetype [Pos, Vel, Health] — flags=1", .{});
+    {
+        if (!col_pos.bindSlot(slotView(base, 0), 0)) fatal("bind pos slot 0", .{});
+        if (!col_vel.bindSlot(slotView(base, 1), 0)) fatal("bind vel slot 1", .{});
+        if (!col_health.bindSlot(slotView(base, 2), 0)) fatal("bind health slot 2", .{});
+
+        try call5(ctx, f_particle, slotAddr(0), slotAddr(1), slotAddr(2), @intCast(entity_count), 1);
+    }
+
+    // verify results
+    {
+        const pv = col_pos.map() orelse fatal("col_pos map (verify)", .{});
+        defer ComponentColumn.unmap(pv);
+        const hv = col_health.map() orelse fatal("col_health map (verify)", .{});
+        defer ComponentColumn.unmap(hv);
+
+        const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+        const healths: [*]Health = @ptrCast(@alignCast(hv.ptr));
+
+        var ok = true;
+        for (0..entity_count) |i| {
+            if (positions[i].x != 1 or positions[i].y != 2) {
+                ok = false;
+                log.err("pos[{d}] = {{{d},{d}}}, expected {{1,2}}", .{ i, positions[i].x, positions[i].y });
+                break;
+            }
+            if (healths[i].current != 9) {
+                ok = false;
+                log.err("health[{d}] = {d}, expected 9", .{ i, healths[i].current });
+                break;
+            }
+        }
+        if (!ok) return error.MultiBindWithHealthFailed;
+        log.debug("[multi-bind] OK: pos={{1,2}} health=9 for all {d} entities", .{entity_count});
+    }
+
+    // dispatch without health (flags = 0, health slot parked)
+    log.debug("[multi-bind] dispatch archetype [Pos, Vel] — flags=0, health slot parked", .{});
+
+    // reset positions
+    {
+        const pv = col_pos.map() orelse fatal("col_pos map (reset)", .{});
+        defer ComponentColumn.unmap(pv);
+        const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+        for (0..entity_count) |i| {
+            positions[i] = .{ .x = 0, .y = 0 };
+        }
+    }
+
+    {
+        if (!col_pos.bindSlot(slotView(base, 0), 0)) fatal("rebind pos slot 0", .{});
+        if (!col_vel.bindSlot(slotView(base, 1), 0)) fatal("rebind vel slot 1", .{});
+        // park slot 2 — health is optional, not present in this archetype
+        if (!Platform.zonePark(slotView(base, 2))) fatal("park slot 2", .{});
+
+        // health_addr = 0 means "not bound"; flags = 0 means no health branch
+        try call5(ctx, f_particle, slotAddr(0), slotAddr(1), 0, @intCast(entity_count), 0);
+    }
+
+    // verify positions updated, health unchanged
+    {
+        const pv = col_pos.map() orelse fatal("col_pos map (verify no-health)", .{});
+        defer ComponentColumn.unmap(pv);
+        const hv = col_health.map() orelse fatal("col_health map (verify no-health)", .{});
+        defer ComponentColumn.unmap(hv);
+
+        const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+        const healths: [*]Health = @ptrCast(@alignCast(hv.ptr));
+
+        var ok = true;
+        for (0..entity_count) |i| {
+            if (positions[i].x != 1 or positions[i].y != 2) {
+                ok = false;
+                log.err("pos[{d}] = {{{d},{d}}}, expected {{1,2}}", .{ i, positions[i].x, positions[i].y });
+                break;
+            }
+            if (healths[i].current != 9) {
+                ok = false;
+                log.err("health[{d}] = {d}, expected 9 (unchanged)", .{ i, healths[i].current });
+                break;
+            }
+        }
+        if (!ok) return error.MultiBindNoHealthFailed;
+        log.debug("[multi-bind] OK: pos={{1,2}} health unchanged=9 (optional component skipped)", .{});
+    }
+
+    // verify unbound slot traps on access
+    try expectTrap(ctx, f_echo, @bitCast(@as(u32, @intCast(binding_region_base + 2 * binding_slot_size))));
+
+    // restore slot 2 for cleanliness
+    _ = Platform.zoneUnpark(st, slotView(base, 2));
+
+    // multi-page column iteration test
+    {
+        const big_count: usize = @divFloor(binding_slot_size, @sizeOf(Position)) + 500;
+        var col_big = ComponentColumn.init(@sizeOf(Position), big_count) orelse fatal("col_big init", .{});
+        defer col_big.deinit();
+
+        const pages = col_big.pageCount();
+        log.debug("[multi-bind] big column: {d} entities, {d} bytes, {d} pages", .{ big_count, col_big.total_bytes, pages });
+        if (pages < 2) return error.BigColumnShouldSpanMultiplePages;
+
+        var col_big_vel = ComponentColumn.init(@sizeOf(Velocity), big_count) orelse fatal("col_big_vel init", .{});
+        defer col_big_vel.deinit();
+
+        {
+            const pv = col_big.map() orelse fatal("col_big map", .{});
+            defer ComponentColumn.unmap(pv);
+            const vv = col_big_vel.map() orelse fatal("col_big_vel map", .{});
+            defer ComponentColumn.unmap(vv);
+
+            const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+            const velocities: [*]Velocity = @ptrCast(@alignCast(vv.ptr));
+
+            for (0..big_count) |i| {
+                positions[i] = .{ .x = 0, .y = 0 };
+                velocities[i] = .{ .x = 3, .y = 4 };
+            }
+        }
+
+        const ents_per_page = @divFloor(binding_slot_size, @sizeOf(Position));
+        for (0..pages) |page_idx| {
+            const page_start = page_idx * ents_per_page;
+            const page_end = @min(page_start + ents_per_page, big_count);
+            const page_count = page_end - page_start;
+
+            if (!col_big.bindSlot(slotView(base, 0), page_idx)) fatal("bind big pos page {d}", .{page_idx});
+            if (!col_big_vel.bindSlot(slotView(base, 1), page_idx)) fatal("bind big vel page {d}", .{page_idx});
+
+            try call5(ctx, f_particle, slotAddr(0), slotAddr(1), 0, @intCast(page_count), 0);
+        }
+
+        {
+            const pv = col_big.map() orelse fatal("col_big map (verify)", .{});
+            defer ComponentColumn.unmap(pv);
+            const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+
+            var ok = true;
+            for (0..big_count) |i| {
+                if (positions[i].x != 3 or positions[i].y != 4) {
+                    ok = false;
+                    log.err("big pos[{d}] = {{{d},{d}}}, expected {{3,4}}", .{ i, positions[i].x, positions[i].y });
+                    break;
+                }
+            }
+            if (!ok) return error.MultiPageIterationFailed;
+            log.debug("[multi-bind] OK: paged {d} entities across {d} pages, all positions={{3,4}}", .{ big_count, pages });
+        }
+    }
+
+    // invariant: guest data still intact after multi-binding
+    if (Platform.guestPeek32(st, @intCast(scr0)) != val_a) return error.GuestRegionMutatedAfterMultiBind;
+    if (Platform.guestPeek32(st, @intCast(scr1)) != val_b) return error.GuestRegionMutatedAfterMultiBind;
+    if (Platform.guestPeek32(st, @intCast(grow_addr)) != 0x5151) return error.GuestRegionMutatedAfterMultiBind;
+
+    log.debug("OK: multi-binding dispatch complete — invariants preserved", .{});
+}
+
+pub const std_options = std.Options{
+    .log_level = .debug,
+};
+
+fn nativeParticleSystem(
+    positions: [*]Position,
+    velocities: [*]Velocity,
+    healths: ?[*]Health,
+    count: usize,
+) void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        positions[i].x += velocities[i].x;
+        positions[i].y += velocities[i].y;
+        if (healths) |h| {
+            if (h[i].current > 0) h[i].current -= 1;
+        }
+    }
+}
+
+pub fn main(init: std.process.Init) !void {
+    Platform.init();
+    const io = init.io;
+    const gpa = init.gpa;
+
+    var eng = try Engine.create();
+    defer eng.destroy();
+    const ctx = eng.ctx;
+
+    const f_particle = try getFunc(ctx, &eng.instance, "particle_system");
+
+    const base = host_mem.base orelse return error.HostMemoryNotCreated;
+
+    const entity_count: usize = 100_000;
+    const warmup_iters: usize = 200;
+    const bench_iters: usize = 10_000;
+
+    log.info("benchmark: {d} entities, {d} warmup + {d} measured iterations", .{ entity_count, warmup_iters, bench_iters });
+
+    // native baseline
+    {
+        const positions = try gpa.alloc(Position, entity_count);
+        defer gpa.free(positions);
+        const velocities = try gpa.alloc(Velocity, entity_count);
+        defer gpa.free(velocities);
+        const healths = try gpa.alloc(Health, entity_count);
+        defer gpa.free(healths);
+
+        for (0..entity_count) |i| {
+            positions[i] = .{ .x = 0, .y = 0 };
+            velocities[i] = .{ .x = 1, .y = 2 };
+            healths[i] = .{ .current = 100 };
+        }
+
+        for (0..warmup_iters) |_| {
+            nativeParticleSystem(positions.ptr, velocities.ptr, healths.ptr, entity_count);
+        }
+
+        const start = std.Io.Clock.awake.now(io);
+        for (0..bench_iters) |_| {
+            nativeParticleSystem(positions.ptr, velocities.ptr, healths.ptr, entity_count);
+        }
+        const end = std.Io.Clock.awake.now(io);
+        const elapsed_ns = start.durationTo(end).nanoseconds;
+
+        const ns_per_iter = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(bench_iters));
+        const ns_per_entity = ns_per_iter / @as(f64, @floatFromInt(entity_count));
+
+        log.info("native:           {d:>12.2} ns/iter  ({d:>6.2} ns/entity)", .{ ns_per_iter, ns_per_entity });
+    }
+
+    // guest with bind-once (measures call + compute overhead)
+    {
+        var col_pos = ComponentColumn.init(@sizeOf(Position), entity_count) orelse fatal("bench col_pos", .{});
+        var col_vel = ComponentColumn.init(@sizeOf(Velocity), entity_count) orelse fatal("bench col_vel", .{});
+        var col_health = ComponentColumn.init(@sizeOf(Health), entity_count) orelse fatal("bench col_health", .{});
+        defer col_pos.deinit();
+        defer col_vel.deinit();
+        defer col_health.deinit();
+
+        {
+            const pv = col_pos.map() orelse fatal("bench map pos", .{});
+            defer ComponentColumn.unmap(pv);
+            const vv = col_vel.map() orelse fatal("bench map vel", .{});
+            defer ComponentColumn.unmap(vv);
+            const hv = col_health.map() orelse fatal("bench map health", .{});
+            defer ComponentColumn.unmap(hv);
+
+            const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+            const velocities: [*]Velocity = @ptrCast(@alignCast(vv.ptr));
+            const healths: [*]Health = @ptrCast(@alignCast(hv.ptr));
+
+            for (0..entity_count) |i| {
+                positions[i] = .{ .x = 0, .y = 0 };
+                velocities[i] = .{ .x = 1, .y = 2 };
+                healths[i] = .{ .current = 100 };
+            }
+        }
+
+        if (!col_pos.bindSlot(slotView(base, 0), 0)) fatal("bench bind pos", .{});
+        if (!col_vel.bindSlot(slotView(base, 1), 0)) fatal("bench bind vel", .{});
+        if (!col_health.bindSlot(slotView(base, 2), 0)) fatal("bench bind health", .{});
+
+        const count_i32: i32 = @intCast(entity_count);
+
+        for (0..warmup_iters) |_| {
+            try call5(ctx, f_particle, slotAddr(0), slotAddr(1), slotAddr(2), count_i32, 1);
+        }
+
+        const start = std.Io.Clock.awake.now(io);
+        for (0..bench_iters) |_| {
+            try call5(ctx, f_particle, slotAddr(0), slotAddr(1), slotAddr(2), count_i32, 1);
+        }
+        const end = std.Io.Clock.awake.now(io);
+        const elapsed_ns = start.durationTo(end).nanoseconds;
+
+        const ns_per_iter = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(bench_iters));
+        const ns_per_entity = ns_per_iter / @as(f64, @floatFromInt(entity_count));
+
+        log.info("guest (bind once): {d:>12.2} ns/iter  ({d:>6.2} ns/entity)", .{ ns_per_iter, ns_per_entity });
+    }
+
+    // guest with rebind each iteration (measures full dispatch cost)
+    {
+        var col_pos = ComponentColumn.init(@sizeOf(Position), entity_count) orelse fatal("bench2 col_pos", .{});
+        var col_vel = ComponentColumn.init(@sizeOf(Velocity), entity_count) orelse fatal("bench2 col_vel", .{});
+        var col_health = ComponentColumn.init(@sizeOf(Health), entity_count) orelse fatal("bench2 col_health", .{});
+        defer col_pos.deinit();
+        defer col_vel.deinit();
+        defer col_health.deinit();
+
+        {
+            const pv = col_pos.map() orelse fatal("bench2 map pos", .{});
+            defer ComponentColumn.unmap(pv);
+            const vv = col_vel.map() orelse fatal("bench2 map vel", .{});
+            defer ComponentColumn.unmap(vv);
+            const hv = col_health.map() orelse fatal("bench2 map health", .{});
+            defer ComponentColumn.unmap(hv);
+
+            const positions: [*]Position = @ptrCast(@alignCast(pv.ptr));
+            const velocities: [*]Velocity = @ptrCast(@alignCast(vv.ptr));
+            const healths: [*]Health = @ptrCast(@alignCast(hv.ptr));
+
+            for (0..entity_count) |i| {
+                positions[i] = .{ .x = 0, .y = 0 };
+                velocities[i] = .{ .x = 1, .y = 2 };
+                healths[i] = .{ .current = 100 };
+            }
+        }
+
+        const sv0 = slotView(base, 0);
+        const sv1 = slotView(base, 1);
+        const sv2 = slotView(base, 2);
+        const count_i32: i32 = @intCast(entity_count);
+
+        for (0..warmup_iters) |_| {
+            _ = col_pos.bindSlot(sv0, 0);
+            _ = col_vel.bindSlot(sv1, 0);
+            _ = col_health.bindSlot(sv2, 0);
+            try call5(ctx, f_particle, slotAddr(0), slotAddr(1), slotAddr(2), count_i32, 1);
+        }
+
+        const start = std.Io.Clock.awake.now(io);
+        for (0..bench_iters) |_| {
+            _ = col_pos.bindSlot(sv0, 0);
+            _ = col_vel.bindSlot(sv1, 0);
+            _ = col_health.bindSlot(sv2, 0);
+            try call5(ctx, f_particle, slotAddr(0), slotAddr(1), slotAddr(2), count_i32, 1);
+        }
+        const end = std.Io.Clock.awake.now(io);
+        const elapsed_ns = start.durationTo(end).nanoseconds;
+
+        const ns_per_iter = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(bench_iters));
+        const ns_per_entity = ns_per_iter / @as(f64, @floatFromInt(entity_count));
+
+        log.info("guest (rebind):    {d:>12.2} ns/iter  ({d:>6.2} ns/entity)", .{ ns_per_iter, ns_per_entity });
+    }
+
+    log.info("benchmark complete.", .{});
 }
