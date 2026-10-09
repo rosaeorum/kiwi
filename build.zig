@@ -174,6 +174,37 @@ pub fn build(b: *Build) !void {
         const run_bench_step = b.step("run-bench", "Run the runtime benchmark");
         run_bench_step.dependOn(&bench_run.step);
     }
+
+    const linker_test_mod = createModule(
+        b,
+        null,
+        b.path("src/linker_test.zig"),
+    );
+    {
+        const script = addZigScript(
+            b,
+            "linker_test_guest",
+            source_writer.add(
+                "linker_test_guest.zig",
+                linker_test_src.guest_src,
+            ),
+        );
+        linker_test_mod.addAnonymousImport("guest.wat", .{
+            .root_source_file = wasm2wat(b, script),
+        });
+        linker_test_mod.addAnonymousImport("guest.wasm", .{
+            .root_source_file = script,
+        });
+
+        const linker_test = b.addTest(.{
+            .root_module = linker_test_mod,
+            .use_lld = true,
+            .use_llvm = true,
+        });
+        check_step.dependOn(&linker_test.step);
+        const linker_test_run = b.addRunArtifact(linker_test);
+        test_step.dependOn(&linker_test_run.step);
+    }
 }
 
 fn createModule(b: *Build, pub_name: ?[]const u8, root_src_file: Build.LazyPath) *Build.Module {
