@@ -320,7 +320,7 @@ fn addZigScript(
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
-        .cpu_features_add = base.Target.wasm.featureSet(&.{ .simd128, .relaxed_simd }),
+        .cpu_features_add = base.Target.wasm.featureSet(&.{.simd128}),
     });
 
     const shader_mod = b.createModule(.{
