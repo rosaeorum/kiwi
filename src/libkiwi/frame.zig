@@ -16,6 +16,6 @@ pub fn idFromIndex(frame_index: u64) Id {
     return @intCast(frame_index % max_in_flight);
 }
 
-const base = @import("base.zig");
+const base = @import("../base.zig");
 const math = base.math;
 const Io = base.Io;

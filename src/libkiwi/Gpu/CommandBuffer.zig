@@ -612,9 +612,9 @@ pub fn syncBufferRegion(
     self.flushed = false;
 }
 
-const base = @import("../base.zig");
-const vk = @import("../vulkan.zig");
-const linalg = @import("../linalg.zig");
+const base = @import("../../base.zig");
+const linalg = @import("../../linalg.zig");
+const vk = @import("../external/vulkan.zig");
 const Gpu = @import("../Gpu.zig");
 
 const debug = base.debug;

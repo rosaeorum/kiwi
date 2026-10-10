@@ -492,8 +492,8 @@ pub fn hostGrowMemory(m: *Memory, new_size: usize) callconv(.c) ?*c.wasmtime_err
     return null;
 }
 
-const c = @import("../wasm.zig");
-const base = @import("../base.zig");
+const c = @import("../external/wasm.zig");
+const base = @import("../../base.zig");
 const mem = base.mem;
 const math = base.math;
 const debug = base.debug;

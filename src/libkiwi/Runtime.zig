@@ -9,7 +9,7 @@ instances: base.StringArrayMap(*Instance) = .empty,
 memories: base.ArrayList(*Memory) = .empty,
 memory_creator: c.wasmtime_memory_creator_t,
 
-pub const c = @import("wasm.zig");
+pub const c = @import("external/wasm.zig");
 pub const Memory = @import("Runtime/Memory.zig");
 pub const Instance = @import("Runtime/Instance.zig");
 
@@ -349,7 +349,7 @@ fn valtypeVecSame(a: c.wasm_valtype_vec_t, b: c.wasm_valtype_vec_t) bool {
     return true;
 }
 
-const base = @import("base.zig");
+const base = @import("../base.zig");
 
 const mem = base.mem;
 const math = base.math;

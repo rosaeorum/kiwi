@@ -261,12 +261,12 @@ pub fn present(self: *Window) Gpu.SwapChain.PresentState {
     return self.swap_chain.presentImage();
 }
 
-const c = @import("glfw.zig");
-const vk = @import("vulkan.zig");
+const c = @import("external/glfw.zig");
+const vk = @import("external/vulkan.zig");
 
-const linalg = @import("linalg.zig");
+const linalg = @import("../linalg.zig");
 const frame = @import("frame.zig");
-const base = @import("base.zig");
+const base = @import("../base.zig");
 const meta = base.meta;
 const log = base.log.scoped(.window);
 const Gpu = @import("Gpu.zig");

@@ -159,9 +159,9 @@ fn memoryTypes(self: *Device) []const vk.MemoryType {
     return self.mem_props.memory_types[0..self.mem_props.memory_type_count];
 }
 
-const base = @import("../base.zig");
-const vk = @import("../vulkan.zig");
-const vma = @import("../vma.zig");
+const base = @import("../../base.zig");
+const vk = @import("../external/vulkan.zig");
+const vma = @import("../external/vma.zig");
 const Gpu = @import("../Gpu.zig");
 
 const mem = base.mem;

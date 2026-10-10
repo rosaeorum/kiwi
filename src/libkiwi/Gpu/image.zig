@@ -216,9 +216,9 @@ pub const Store = struct {
     }
 };
 
-const base = @import("../base.zig");
-const vk = @import("../vulkan.zig");
-const vma = @import("../vma.zig");
+const base = @import("../../base.zig");
+const vk = @import("../external/vulkan.zig");
+const vma = @import("../external/vma.zig");
 const Gpu = @import("../Gpu.zig");
 
 const mem = base.mem;

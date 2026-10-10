@@ -374,9 +374,9 @@ fn findActualExtent(caps: vk.SurfaceCapabilitiesKHR, extent: linalg.vec2u) linal
     }
 }
 
-const base = @import("../base.zig");
-const linalg = @import("../linalg.zig");
-const vk = @import("../vulkan.zig");
+const base = @import("../../base.zig");
+const linalg = @import("../../linalg.zig");
+const vk = @import("../external/vulkan.zig");
 const frame = @import("../frame.zig");
 const Gpu = @import("../Gpu.zig");
 

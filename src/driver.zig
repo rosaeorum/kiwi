@@ -191,7 +191,7 @@ const @"vert.spv": []const u32 = @ptrCast(@alignCast(@embedFile("vert.spv")));
 const @"frag.spv": []const u32 = @ptrCast(@alignCast(@embedFile("frag.spv")));
 const @"image.png": []const u8 = @embedFile("image.png");
 
-const kiwi = @import("module/kiwi.zig");
+const kiwi = @import("libkiwi.zig");
 
 const Gpu = kiwi.Gpu;
 const Client = kiwi.Client;

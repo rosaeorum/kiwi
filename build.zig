@@ -74,7 +74,7 @@ pub fn build(b: *Build) !void {
 
     // NOTE: there is a bug on linux where static linking wasmtime fails under self hosted linker; must use lld for now
 
-    const kiwi_mod = createModule(b, "kiwi", b.path("src/module/kiwi.zig"));
+    const kiwi_mod = createModule(b, "kiwi", b.path("src/libkiwi.zig"));
     {
         const kiwi_test = b.addTest(.{
             .root_module = kiwi_mod,
@@ -471,9 +471,9 @@ fn buildWasmtime(b: *Build) Build.LazyPath {
     const wasmtime_bindings = t.output_file;
 
     const write_wasm_bindings_source = b.addUpdateSourceFiles();
-    write_wasm_bindings_source.addCopyFileToSource(wasmtime_bindings, "src/module/wasm.zig");
+    write_wasm_bindings_source.addCopyFileToSource(wasmtime_bindings, "src/libkiwi/external/wasm.zig");
 
-    const wasm_bindgen_step = b.step("gen-wasm", "run translate-c to update src/module/wasmtime.zig");
+    const wasm_bindgen_step = b.step("gen-wasm", "run translate-c to update src/libkiwi/external/wasmtime.zig");
     wasm_bindgen_step.dependOn(&write_wasm_bindings_source.step);
 
     return wasmtime_dep.path("lib/");
@@ -506,9 +506,9 @@ fn buildVk(b: *Build) *Build.Step.Compile {
     const vulkan_bindings = vulkan_bindgen_run.addOutputFileArg2("vulkan.zig", .{});
 
     const write_vulkan_bindings_source = b.addUpdateSourceFiles();
-    write_vulkan_bindings_source.addCopyFileToSource(vulkan_bindings, "src/module/vulkan.zig");
+    write_vulkan_bindings_source.addCopyFileToSource(vulkan_bindings, "src/libkiwi/external/vulkan.zig");
 
-    const vk_bindgen_step = b.step("gen-vk", "run vulkan-zig-generator to update src/module/vulkan.zig");
+    const vk_bindgen_step = b.step("gen-vk", "run vulkan-zig-generator to update src/libkiwi/external/vulkan.zig");
     vk_bindgen_step.dependOn(&write_vulkan_bindings_source.step);
 
     return lib;
@@ -591,9 +591,9 @@ fn buildGlfw(b: *Build) *Build.Step.Compile {
     const glfw_bindings = t.output_file;
 
     const write_glfw_bindings_source = b.addUpdateSourceFiles();
-    write_glfw_bindings_source.addCopyFileToSource(glfw_bindings, "src/module/glfw.zig");
+    write_glfw_bindings_source.addCopyFileToSource(glfw_bindings, "src/libkiwi/external/glfw.zig");
 
-    const glfw_bindgen_step = b.step("gen-glfw", "run translate-c to update src/module/glfw.zig");
+    const glfw_bindgen_step = b.step("gen-glfw", "run translate-c to update src/libkiwi/external/glfw.zig");
     glfw_bindgen_step.dependOn(&write_glfw_bindings_source.step);
 
     const lib = b.addLibrary(.{
@@ -660,7 +660,7 @@ fn buildGlfw(b: *Build) *Build.Step.Compile {
 const config = @import("build.config.zig");
 const zon_text = @embedFile("build.zig.zon");
 
-const base = @import("src/module/base.zig");
+const base = @import("src/base.zig");
 
 const runtime_test_src = @import("src/runtime_test.zig");
 

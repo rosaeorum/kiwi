@@ -586,14 +586,14 @@ pub const DeviceAddress = vk.DeviceAddress;
 pub const PushConstantRange = vk.PushConstantRange;
 pub const ImageView = vk.ImageView;
 
-pub const vk = @import("vulkan.zig");
-pub const vma = @import("vma.zig");
+pub const vk = @import("external/vulkan.zig");
+pub const vma = @import("external/vma.zig");
 
-const linalg = @import("linalg.zig");
+const linalg = @import("../linalg.zig");
 const frame = @import("frame.zig");
 const Window = @import("Window.zig");
 const vec2u = linalg.vec2u;
-const base = @import("base.zig");
+const base = @import("../base.zig");
 const mem = base.mem;
 const math = base.math;
 const meta = base.meta;

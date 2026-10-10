@@ -748,7 +748,7 @@ pub fn main(init: base.process.Init) !void {
     log.info("benchmark complete.", .{});
 }
 
-const kiwi = @import("module/kiwi.zig");
+const kiwi = @import("libkiwi.zig");
 
 const guest_a_wasm: []const u8 = @embedFile("guest_a.wasm");
 const guest_b_wasm: []const u8 = @embedFile("guest_b.wasm");

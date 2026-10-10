@@ -23,8 +23,11 @@
 
 const spv_patch = @This();
 
-const std = @import("std");
-const builtin = @import("builtin");
+const base = @import("base.zig");
+const mem = base.mem;
+const debug = base.debug;
+const process = base.process;
+const Io = base.Io;
 
 const MAGIC: u32 = 0x07230203;
 const HEADER_WORDS: usize = 5;
@@ -39,7 +42,7 @@ const Decoration = struct {
     pub const block: u32 = 2;
 };
 
-const native_endian = builtin.target.cpu.arch.endian();
+const native_endian = base.build_info.target.cpu.arch.endian();
 
 inline fn readWord(words: []const u32, idx: usize) u32 {
     const raw = words[idx];
@@ -80,32 +83,32 @@ const InstructionIter = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     var verbose: bool = false;
-    var positional: std.array_list.Managed([]const u8) = .init(init.gpa);
-    defer positional.deinit();
+    var positional: base.ArrayList([]const u8) = .empty;
+    defer positional.deinit(init.gpa);
 
     for (argv[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+        if (mem.eql(u8, arg, "-v") or mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         } else {
-            try positional.append(arg);
+            try positional.append(init.gpa, arg);
         }
     }
 
     if (positional.items.len != 2) {
-        std.debug.print(
+        debug.print(
             "Usage: spv_patch [-v] <input.spv> <output.spv>\n",
             .{},
         );
-        std.process.exit(1);
+        process.exit(1);
     }
     const input_path = positional.items[0];
     const output_path = positional.items[1];
 
-    const input = try std.Io.Dir.cwd().readFileAllocOptions(
+    const input = try Io.Dir.cwd().readFileAllocOptions(
         init.io,
         input_path,
         init.gpa,
@@ -116,31 +119,31 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(input);
 
     if (input.len < HEADER_WORDS * 4) {
-        std.debug.print("Error: File too small to be valid SPIR-V\n", .{});
-        std.process.exit(1);
+        debug.print("Error: File too small to be valid SPIR-V\n", .{});
+        process.exit(1);
     }
     if (input.len % 4 != 0) {
-        std.debug.print("Error: SPIR-V binary size not a multiple of 4\n", .{});
-        std.process.exit(1);
+        debug.print("Error: SPIR-V binary size not a multiple of 4\n", .{});
+        process.exit(1);
     }
 
-    const words = std.mem.bytesAsSlice(u32, input);
+    const words = mem.bytesAsSlice(u32, input);
 
     if (readWord(words, 0) != MAGIC) {
-        std.debug.print("Error: Invalid SPIR-V magic number (got 0x{x:0>8}, expected 0x{x:0>8})\n", .{
+        debug.print("Error: Invalid SPIR-V magic number (got 0x{x:0>8}, expected 0x{x:0>8})\n", .{
             readWord(words, 0), MAGIC,
         });
-        std.process.exit(1);
+        process.exit(1);
     }
 
-    var runtime_array_ids = std.AutoHashMap(u32, void).init(init.gpa);
-    defer runtime_array_ids.deinit();
+    var runtime_array_ids = base.HashMap(u32, void).empty;
+    defer runtime_array_ids.deinit(init.gpa);
 
-    var structs_needing_block = std.AutoHashMap(u32, void).init(init.gpa);
-    defer structs_needing_block.deinit();
+    var structs_needing_block = base.HashMap(u32, void).empty;
+    defer structs_needing_block.deinit(init.gpa);
 
-    var existing_block = std.AutoHashMap(u32, void).init(init.gpa);
-    defer existing_block.deinit();
+    var existing_block = base.HashMap(u32, void).empty;
+    defer existing_block.deinit(init.gpa);
 
     var insert_at: usize = words.len;
 
@@ -154,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
             Opcode.type_runtime_array => {
                 if (inst.word_count >= 3) {
                     const result_id = readWord(words, inst.offset + 1);
-                    try runtime_array_ids.put(result_id, {});
+                    try runtime_array_ids.put(init.gpa, result_id, {});
                 }
             },
 
@@ -166,7 +169,7 @@ pub fn main(init: std.process.Init) !void {
                     while (member_idx < inst.word_count) : (member_idx += 1) {
                         const member_type = readWord(words, inst.offset + member_idx);
                         if (runtime_array_ids.contains(member_type)) {
-                            try structs_needing_block.put(struct_id, {});
+                            try structs_needing_block.put(init.gpa, struct_id, {});
                             break;
                         }
                     }
@@ -178,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
                     const target_id = readWord(words, inst.offset + 1);
                     const decoration = readWord(words, inst.offset + 2);
                     if (decoration == Decoration.block) {
-                        try existing_block.put(target_id, {});
+                        try existing_block.put(init.gpa, target_id, {});
                     }
                 }
             },
@@ -187,35 +190,35 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var to_decorate = std.array_list.Managed(u32).init(init.gpa);
-    defer to_decorate.deinit();
+    var to_decorate = base.ArrayList(u32).empty;
+    defer to_decorate.deinit(init.gpa);
 
     var it = structs_needing_block.iterator();
     while (it.next()) |entry| {
         const id = entry.key_ptr.*;
         if (!existing_block.contains(id)) {
-            try to_decorate.append(id);
+            try to_decorate.append(init.gpa, id);
         }
     }
 
     if (to_decorate.items.len == 0) {
-        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = input });
+        try Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = input });
         if (verbose) {
-            std.debug.print("No patches needed. Copied as-is.\n", .{});
+            debug.print("No patches needed. Copied as-is.\n", .{});
         }
         return;
     }
 
     if (insert_at >= words.len) {
-        std.debug.print("Error: Could not find types section in SPIR-V binary\n", .{});
-        std.process.exit(1);
+        debug.print("Error: Could not find types section in SPIR-V binary\n", .{});
+        process.exit(1);
     }
 
     const new_inst_count = to_decorate.items.len * 3;
     const total_words = words.len + new_inst_count;
     const output_bytes = try init.gpa.alignedAlloc(u8, .of(u32), total_words * 4);
     defer init.gpa.free(output_bytes);
-    const output_words = std.mem.bytesAsSlice(u32, output_bytes);
+    const output_words = mem.bytesAsSlice(u32, output_bytes);
 
     for (0..insert_at) |i| {
         writeWord(output_words, i, readWord(words, i));
@@ -228,7 +231,7 @@ pub fn main(init: std.process.Init) !void {
         writeWord(output_words, write_pos + 2, Decoration.block);
         write_pos += 3;
         if (verbose) {
-            std.debug.print("Added: OpDecorate %{} Block\n", .{struct_id});
+            debug.print("Added: OpDecorate %{} Block\n", .{struct_id});
         }
     }
 
@@ -237,11 +240,11 @@ pub fn main(init: std.process.Init) !void {
         write_pos += 1;
     }
 
-    std.debug.assert(write_pos == total_words);
+    debug.assert(write_pos == total_words);
 
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = output_bytes });
+    try Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = output_bytes });
     if (verbose) {
-        std.debug.print(
+        debug.print(
             "Patched {d} struct(s) with Block decoration. Output: {s}\n",
             .{ to_decorate.items.len, output_path },
         );

@@ -92,9 +92,9 @@ pub fn pollEvents(_: *Client) void {
 
 pub const Window = @import("Window.zig");
 
-const c = @import("glfw.zig");
-const linalg = @import("linalg.zig");
-const base = @import("base.zig");
+const c = @import("external/glfw.zig");
+const linalg = @import("../linalg.zig");
+const base = @import("../base.zig");
 const mem = base.mem;
 const log = base.log.scoped(.client);
 const Gpu = @import("Gpu.zig");

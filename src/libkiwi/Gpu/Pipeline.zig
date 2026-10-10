@@ -229,7 +229,7 @@ const stencil_state_3d = vk.PipelineDepthStencilStateCreateInfo{
     .max_depth_bounds = 1.0,
 };
 
-const base = @import("../base.zig");
-const vk = @import("../vulkan.zig");
+const base = @import("../../base.zig");
+const vk = @import("../external/vulkan.zig");
 const Gpu = @import("../Gpu.zig");
 const log = base.log.scoped(.Gpu);

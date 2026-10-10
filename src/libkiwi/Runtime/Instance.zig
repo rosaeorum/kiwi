@@ -28,8 +28,8 @@ pub fn call(self: *Instance, name: []const u8, args: []const i32, results: []i32
     try self.runtime.call(f, args, results);
 }
 
-const c = @import("../wasm.zig");
-const base = @import("../base.zig");
+const c = @import("../external/wasm.zig");
+const base = @import("../../base.zig");
 const Runtime = @import("../Runtime.zig");
 const Memory = @import("Memory.zig");
 
