@@ -1,10 +1,11 @@
 const Runtime = @This();
 
 alloc: base.Allocator,
+arena: base.Arena,
 engine: *c.wasm_engine_t,
 store: *c.wasmtime_store_t,
 modules: base.ArrayList(*c.wasmtime_module_t) = .empty,
-instances: base.ArrayList(Instance) = .empty,
+instances: base.StringArrayMap(*Instance) = .empty,
 memories: base.ArrayList(*Memory) = .empty,
 memory_creator: c.wasmtime_memory_creator_t,
 
@@ -18,10 +19,13 @@ pub const max_call_results: usize = 8;
 pub fn init(alloc: base.Allocator) !*Runtime {
     Memory.setup_platform();
 
-    const self = try alloc.create(Runtime);
-    errdefer alloc.destroy(self);
+    var arena = base.Arena.init(alloc);
+    errdefer arena.deinit();
+
+    const self = try arena.allocator().create(Runtime);
     self.* = .{
         .alloc = alloc,
+        .arena = arena,
         .engine = undefined,
         .store = undefined,
         .memory_creator = .{
@@ -58,32 +62,128 @@ pub fn deinit(self: *Runtime) void {
     self.modules.deinit(self.alloc);
     self.instances.deinit(self.alloc);
     self.memories.deinit(self.alloc);
-    const alloc = self.alloc;
-    alloc.destroy(self);
+    var arena = self.arena;
+    arena.deinit();
 }
 
 pub fn addModule(self: *Runtime, wasm: []const u8) !*c.wasmtime_module_t {
     var module: ?*c.wasmtime_module_t = null;
-    if (c.wasmtime_module_new(self.engine, wasm.ptr, wasm.len, &module)) |e| return dieError(e);
+    if (c.wasmtime_module_new(
+        self.engine,
+        wasm.ptr,
+        wasm.len,
+        &module,
+    )) |e|
+        return dieError(e);
     errdefer c.wasmtime_module_delete(module.?);
     const m = module orelse return error.ModuleNewFailed;
     try self.modules.append(self.alloc, m);
     return m;
 }
 
-/// instantiate `module`, binding `imports` (in the module's declared import order); pass other instance's `export(...)` items to link modules
-pub fn instantiate(self: *Runtime, module: *c.wasmtime_module_t, imports: []const c.wasmtime_extern_t) !Instance {
+pub fn instantiate(self: *Runtime, module_name: []const u8, module: *c.wasmtime_module_t) !*Instance {
+    const gop = try self.instances.getOrPut(self.alloc, module_name);
+    if (gop.found_existing) {
+        return error.ModuleNameAlreadyRegistered;
+    }
+    errdefer _ = self.instances.swapRemove(module_name);
+
+    gop.key_ptr.* = try self.arena.allocator().dupe(u8, module_name);
+
+    var imports: c.wasm_importtype_vec_t = undefined;
+    c.wasmtime_module_imports(module, &imports);
+    defer imports.wasm_importtype_vec_delete();
+
+    var args = base.ArrayList(c.wasmtime_extern_t).empty;
+    defer args.deinit(self.alloc);
+
+    args: for (0..imports.size) |imp_index| {
+        const imp = imports.data[imp_index];
+        const imported_mod_bvec = c.wasm_importtype_module(imp);
+        const imported_sym_bvec = c.wasm_importtype_name(imp);
+        const imported_ty = c.wasm_importtype_type(imp).?;
+
+        const imported_mod = imported_mod_bvec.*.data[0..imported_mod_bvec.*.size];
+        const imported_sym = imported_sym_bvec.*.data[0..imported_sym_bvec.*.size];
+
+        if (mem.eql(u8, "env", imported_mod)) {
+            base.todo(noreturn);
+        } else if (self.instances.get(imported_mod)) |existing_instance| {
+            var exports: c.wasm_exporttype_vec_t = undefined;
+            c.wasmtime_module_exports(existing_instance.module, &exports);
+            defer exports.wasm_exporttype_vec_delete();
+
+            for (0..exports.size) |exp_index| {
+                const exp = exports.data[exp_index];
+                const exported_sym_bvec = c.wasm_exporttype_name(exp);
+                const exported_sym = exported_sym_bvec.*.data[0..exported_sym_bvec.*.size];
+
+                if (mem.eql(u8, imported_sym, exported_sym)) {
+                    const exported_ty = c.wasm_exporttype_type(exp).?;
+
+                    if (!externtypeSame(imported_ty, exported_ty)) {
+                        if (!base.build_info.is_test or base.testing.log_level == .debug)
+                            log.err(
+                                "cannot link module `{s}`: type mismatch for imported symbol '{s}' from module '{s}'",
+                                .{ module_name, imported_sym, imported_mod },
+                            );
+                        return error.TypeMismatch;
+                    }
+
+                    const value = existing_instance.@"export"(imported_sym) catch unreachable;
+                    try args.append(self.alloc, value);
+                    continue :args;
+                }
+            }
+
+            if (!base.build_info.is_test or base.testing.log_level == .debug)
+                log.err(
+                    "cannot link module `{s}`: imported module `{s}` does not export a symbol `{s}`",
+                    .{ module_name, imported_mod, imported_sym },
+                );
+            return error.MissingImport;
+        } else {
+            if (!base.build_info.is_test or base.testing.log_level == .debug)
+                log.err(
+                    "cannot link module `{s}`: imported module `{s}` does not exist",
+                    .{ module_name, imported_mod },
+                );
+            return error.MissingImport;
+        }
+    }
+
+    const inst = try self.arena.allocator().create(Instance);
+    gop.value_ptr.* = inst;
+
     const mem_before = self.memories.items.len;
     var trap: ?*c.wasm_trap_t = null;
     var handle: c.wasmtime_instance_t = undefined;
-    if (c.wasmtime_instance_new(self.context(), module, imports.ptr, imports.len, &handle, &trap)) |e| return dieError(e);
-    if (trap) |t| return dieTrap(t);
+
+    if (c.wasmtime_instance_new(
+        self.context(),
+        module,
+        args.items.ptr,
+        args.items.len,
+        &handle,
+        &trap,
+    )) |e|
+        return dieError(e);
+
+    if (trap) |t|
+        return dieTrap(t);
+
     if (self.memories.items.len != mem_before + 1) {
         log.err("instantiate: expected exactly one host memory per instance", .{});
         return error.MemoryCountMismatch;
     }
-    const inst = Instance{ .runtime = self, .handle = handle, .memory = self.memories.items[mem_before] };
-    try self.instances.append(self.alloc, inst);
+
+    inst.* = Instance{
+        .runtime = self,
+        .module = module,
+        .handle = handle,
+        .memory = self.memories.items[mem_before],
+    };
+
     return inst;
 }
 
@@ -176,15 +276,77 @@ fn dieTrap(t: *c.wasm_trap_t) error{RuntimeFailure} {
     return error.RuntimeFailure;
 }
 
-fn call1(inst: Instance, name: []const u8, a: i32) !i32 {
+fn call1(inst: *Instance, name: []const u8, a: i32) !i32 {
     var r: [1]i32 = undefined;
     try inst.call(name, &.{a}, &r);
     return r[0];
 }
 
-fn expectTrap(inst: Instance, name: []const u8, arg: i32) !void {
+fn expectTrap(inst: *Instance, name: []const u8, arg: i32) !void {
     _ = call1(inst, name, arg) catch return;
     return error.ExpectedTrap;
+}
+
+fn externtypeSame(a: *const c.wasm_externtype_t, b: *const c.wasm_externtype_t) bool {
+    const kind_a = c.wasm_externtype_kind(a);
+    const kind_b = c.wasm_externtype_kind(b);
+    if (kind_a != kind_b) return false;
+
+    switch (kind_a) {
+        c.WASM_EXTERN_FUNC => {
+            const func_a = c.wasm_externtype_as_functype_const(a).?;
+            const func_b = c.wasm_externtype_as_functype_const(b).?;
+
+            const params_a = c.wasm_functype_params(func_a).*;
+            const params_b = c.wasm_functype_params(func_b).*;
+            if (!valtypeVecSame(params_a, params_b)) return false;
+
+            const results_a = c.wasm_functype_results(func_a).*;
+            const results_b = c.wasm_functype_results(func_b).*;
+            return valtypeVecSame(results_a, results_b);
+        },
+        c.WASM_EXTERN_GLOBAL => {
+            const glob_a = c.wasm_externtype_as_globaltype_const(a).?;
+            const glob_b = c.wasm_externtype_as_globaltype_const(b).?;
+
+            if (c.wasm_globaltype_mutability(glob_a) != c.wasm_globaltype_mutability(glob_b)) return false;
+
+            const ty_a = c.wasm_globaltype_content(glob_a);
+            const ty_b = c.wasm_globaltype_content(glob_b);
+            return c.wasm_valtype_kind(ty_a) == c.wasm_valtype_kind(ty_b);
+        },
+        c.WASM_EXTERN_TABLE => {
+            const tab_a = c.wasm_externtype_as_tabletype_const(a).?;
+            const tab_b = c.wasm_externtype_as_tabletype_const(b).?;
+
+            const el_a = c.wasm_tabletype_element(tab_a);
+            const el_b = c.wasm_tabletype_element(tab_b);
+            if (c.wasm_valtype_kind(el_a) != c.wasm_valtype_kind(el_b)) return false;
+
+            const lim_a = c.wasm_tabletype_limits(tab_a).*;
+            const lim_b = c.wasm_tabletype_limits(tab_b).*;
+            return lim_a.min == lim_b.min and lim_a.max == lim_b.max;
+        },
+        c.WASM_EXTERN_MEMORY => {
+            const mem_a = c.wasm_externtype_as_memorytype_const(a).?;
+            const mem_b = c.wasm_externtype_as_memorytype_const(b).?;
+
+            const lim_a = c.wasm_memorytype_limits(mem_a).*;
+            const lim_b = c.wasm_memorytype_limits(mem_b).*;
+            return lim_a.min == lim_b.min and lim_a.max == lim_b.max;
+        },
+        else => return false,
+    }
+}
+
+fn valtypeVecSame(a: c.wasm_valtype_vec_t, b: c.wasm_valtype_vec_t) bool {
+    if (a.size != b.size) return false;
+    for (0..a.size) |i| {
+        if (c.wasm_valtype_kind(a.data[i]) != c.wasm_valtype_kind(b.data[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 const base = @import("base.zig");

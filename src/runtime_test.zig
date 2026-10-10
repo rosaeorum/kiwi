@@ -63,13 +63,13 @@ fn nativeParticleSystem(
     }
 }
 
-fn call1(inst: Instance, name: []const u8, a: i32) !i32 {
+fn call1(inst: *Instance, name: []const u8, a: i32) !i32 {
     var r: [1]i32 = undefined;
     try inst.call(name, &.{a}, &r);
     return r[0];
 }
 
-fn expectTrap(inst: Instance, name: []const u8, arg: i32) !void {
+fn expectTrap(inst: *Instance, name: []const u8, arg: i32) !void {
     _ = call1(inst, name, arg) catch return;
     return error.ExpectedTrap;
 }
@@ -148,7 +148,7 @@ pub const guest_a_src: []const u8 =
     ;
 
 pub const guest_b_src: []const u8 =
-    \\extern fn mul2(v: i32) i32;
+    \\extern "provider" fn mul2(v: i32) i32;
     \\export fn mul2Plus(v: i32) i32 {
     \\    return mul2(v) + 100;
     \\}
@@ -183,8 +183,8 @@ test {
     const mod_a = try runtime.addModule(guest_a_wasm);
     const mod_b = try runtime.addModule(guest_b_wasm);
 
-    const inst_a = try runtime.instantiate(mod_a, &.{});
-    const inst_b = try runtime.instantiate(mod_b, &.{try inst_a.@"export"("mul2")});
+    const inst_a = try runtime.instantiate("provider", mod_a);
+    const inst_b = try runtime.instantiate("consumer", mod_b);
 
     const mem = inst_a.memory;
     const mem_b = inst_b.memory;
@@ -599,7 +599,7 @@ pub fn main(init: base.process.Init) !void {
     defer runtime.deinit();
 
     const module = try runtime.addModule(guest_a_wasm);
-    const inst = try runtime.instantiate(module, &.{});
+    const inst = try runtime.instantiate("benchmark", module);
     const f_particle = try inst.func("particle_system");
     const mem = inst.memory;
 
