@@ -37,10 +37,12 @@
         .wasmtime_linux = .{
             .url = "https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.0-rc.1/wasmtime-v50.0.0-rc.1-x86_64-linux-c-api.tar.xz",
             .hash = "N-V-__8AAIYrdgZbtNWh99VCphRnmvPZ4iOlnho3UCE32C-d",
+            .lazy = true,
         },
         .wasmtime_mingw = .{
             .url = "https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.0-rc.1/wasmtime-v50.0.0-rc.1-x86_64-mingw-c-api.zip",
             .hash = "N-V-__8AALnYCwdoVi316a6Ho_--HTWxoFW6_QRWhwf3BM-x",
+            .lazy = true,
         },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#02ff0c523fb92a38939b04d0145c4a9602a74d56",
