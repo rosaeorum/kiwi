@@ -106,7 +106,10 @@ pub const guest_a_src: []const u8 =
     \\export fn scratchAddr(idx: u32) u32 {
     \\    return @intCast(@intFromPtr(&scratch[idx]));
     \\}
+    \\extern fn console_log(v: u32, l: u32) void;
     \\export fn mul2(v: i32) i32 {
+    \\    const msg = "hello world";
+    \\    console_log(@intCast(@intFromPtr(msg.ptr)), @intCast(msg.len));
     \\    // observable side effect: lets the host prove that cross-instance
     \\    // calls into this module actually land in this instance's memory
     \\    scratch[2] += 1;
@@ -177,6 +180,10 @@ pub const guest_b_src: []const u8 =
 ;
 
 test {
+    // const old_log_level = base.testing.log_level;
+    // defer base.testing.log_level = old_log_level;
+    // base.testing.log_level = .info;
+
     const runtime = try Runtime.init(base.testing.allocator);
     defer runtime.deinit();
 
@@ -754,8 +761,8 @@ const guest_a_wasm: []const u8 = @embedFile("guest_a.wasm");
 const guest_b_wasm: []const u8 = @embedFile("guest_b.wasm");
 
 const base = kiwi.base;
+const c = kiwi.wasm;
 const Runtime = kiwi.Runtime;
-const c = kiwi.Runtime.c;
 const Memory = Runtime.Memory;
 const Instance = Runtime.Instance;
 const getI32 = Memory.getI32;

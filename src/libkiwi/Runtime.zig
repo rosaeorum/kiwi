@@ -4,17 +4,19 @@ alloc: base.Allocator,
 arena: base.Arena,
 engine: *c.wasm_engine_t,
 store: *c.wasmtime_store_t,
+env: base.StringArrayMap(c.wasmtime_extern_t) = .empty,
 modules: base.ArrayList(*c.wasmtime_module_t) = .empty,
 instances: base.StringArrayMap(*Instance) = .empty,
 memories: base.ArrayList(*Memory) = .empty,
 memory_creator: c.wasmtime_memory_creator_t,
 
-pub const c = @import("external/wasm.zig");
+const c = @import("external/wasm.zig");
+
 pub const Memory = @import("Runtime/Memory.zig");
 pub const Instance = @import("Runtime/Instance.zig");
 
-pub const max_call_args: usize = Memory.max_binding_slots + 8;
-pub const max_call_results: usize = 8;
+pub const max_call_args: u64 = Memory.max_binding_slots + 8;
+pub const max_call_results: u64 = 8;
 
 pub fn init(alloc: base.Allocator) !*Runtime {
     Memory.setup_platform();
@@ -51,6 +53,37 @@ pub fn init(alloc: base.Allocator) !*Runtime {
     self.store = store;
     errdefer c.wasmtime_store_delete(self.store);
 
+    try self.env.put(alloc, "console_log", try self.wrap(
+        &.{
+            c.wasm_valtype_new(c.WASM_I32),
+            c.wasm_valtype_new(c.WASM_I32),
+        },
+        &.{},
+        struct {
+            inline fn callback(
+                _: *Runtime,
+                caller: *c.wasmtime_caller_t,
+                inputs: []const c.wasmtime_val_t,
+                outputs: []c.wasmtime_val_t,
+            ) anyerror!void {
+                _ = outputs;
+                const s: u32 = @bitCast(inputs[0].of.i32);
+                const l: u32 = @bitCast(inputs[1].of.i32);
+
+                var item: c.wasmtime_extern_t = undefined;
+                const has_mem = c.wasmtime_caller_export_get(caller, "memory", "memory".len, &item);
+                debug.assert(has_mem and item.kind == c.WASMTIME_EXTERN_MEMORY);
+
+                const memory = &item.of.memory;
+
+                const ctx = c.wasmtime_caller_context(caller);
+
+                const mem_data = c.wasmtime_memory_data(ctx, memory);
+                base.log.scoped(.Guest).info("{s}", .{mem_data[s .. s + l]});
+            }
+        }.callback,
+    ));
+
     return self;
 }
 
@@ -59,6 +92,7 @@ pub fn deinit(self: *Runtime) void {
     c.wasmtime_store_delete(self.store);
     c.wasm_engine_delete(self.engine);
     for (self.memories.items) |m| m.deinit();
+    self.env.deinit(self.alloc);
     self.modules.deinit(self.alloc);
     self.instances.deinit(self.alloc);
     self.memories.deinit(self.alloc);
@@ -81,6 +115,72 @@ pub fn addModule(self: *Runtime, wasm: []const u8) !*c.wasmtime_module_t {
     return m;
 }
 
+fn wrap(
+    self: *Runtime,
+    input_types: []const ?*c.wasm_valtype_t,
+    output_types: []const ?*c.wasm_valtype_t,
+    comptime callback: fn (
+        *Runtime,
+        *c.wasmtime_caller_t,
+        []const c.wasmtime_val_t,
+        []c.wasmtime_val_t,
+    ) callconv(.@"inline") anyerror!void,
+) !c.wasmtime_extern_t {
+    const fun_ty: *c.wasm_functype_t = make_fun_ty: {
+        var inputs: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&inputs, input_types.len, input_types.ptr);
+
+        var outputs: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&outputs, output_types.len, output_types.ptr);
+
+        break :make_fun_ty c.wasm_functype_new(&inputs, &outputs).?;
+    };
+    defer c.wasm_functype_delete(fun_ty);
+
+    var func: c.wasmtime_func_t = undefined;
+    c.wasmtime_func_new(
+        self.context(),
+        fun_ty,
+        wrap_callback(Runtime, callback),
+        self,
+        null,
+        &func,
+    );
+
+    return .{
+        .kind = c.WASM_EXTERN_FUNC,
+        .of = c.union_wasmtime_extern_union{ .func = func },
+    };
+}
+
+fn wrap_callback(
+    T: type,
+    callback: fn (
+        *T,
+        *c.wasmtime_caller_t,
+        []const c.wasmtime_val_t,
+        []c.wasmtime_val_t,
+    ) callconv(.@"inline") anyerror!void,
+) c.wasmtime_func_callback_t {
+    return &struct {
+        fn wasm_wrapper(
+            env: ?*anyopaque,
+            caller: ?*c.wasmtime_caller_t,
+            inputs: [*c]const c.wasmtime_val_t,
+            input_count: u64,
+            outputs: [*c]c.wasmtime_val_t,
+            output_count: u64,
+        ) callconv(.c) ?*c.wasm_trap_t {
+            callback(@ptrCast(@alignCast(env.?)), caller.?, inputs[0..input_count], outputs[0..output_count]) catch |err| {
+                const msg = @errorName(err);
+                return c.wasmtime_trap_new(msg.ptr, msg.len);
+            };
+
+            return null;
+        }
+    }.wasm_wrapper;
+}
+
 pub fn instantiate(self: *Runtime, module_name: []const u8, module: *c.wasmtime_module_t) !*Instance {
     const gop = try self.instances.getOrPut(self.alloc, module_name);
     if (gop.found_existing) {
@@ -97,7 +197,7 @@ pub fn instantiate(self: *Runtime, module_name: []const u8, module: *c.wasmtime_
     var args = base.ArrayList(c.wasmtime_extern_t).empty;
     defer args.deinit(self.alloc);
 
-    args: for (0..imports.size) |imp_index| {
+    for (0..imports.size) |imp_index| {
         const imp = imports.data[imp_index];
         const imported_mod_bvec = c.wasm_importtype_module(imp);
         const imported_sym_bvec = c.wasm_importtype_name(imp);
@@ -106,50 +206,39 @@ pub fn instantiate(self: *Runtime, module_name: []const u8, module: *c.wasmtime_
         const imported_mod = imported_mod_bvec.*.data[0..imported_mod_bvec.*.size];
         const imported_sym = imported_sym_bvec.*.data[0..imported_sym_bvec.*.size];
 
-        if (mem.eql(u8, "env", imported_mod)) {
-            base.todo(noreturn);
-        } else if (self.instances.get(imported_mod)) |existing_instance| {
-            var exports: c.wasm_exporttype_vec_t = undefined;
-            c.wasmtime_module_exports(existing_instance.module, &exports);
-            defer exports.wasm_exporttype_vec_delete();
+        const value =
+            (if (mem.eql(u8, "env", imported_mod))
+                self.env.get(imported_sym)
+            else if (self.instances.get(imported_mod)) |existing_instance|
+                existing_instance.@"export"(imported_sym) catch null
+            else {
+                if (!base.build_info.is_test or base.testing.log_level == .debug)
+                    log.err(
+                        "cannot link module `{s}`: imported module `{s}` does not exist",
+                        .{ module_name, imported_mod },
+                    );
+                return error.MissingImport;
+            }) orelse {
+                if (!base.build_info.is_test or base.testing.log_level == .debug)
+                    log.err(
+                        "cannot link module `{s}`: imported module `{s}` does not export a symbol `{s}`",
+                        .{ module_name, imported_mod, imported_sym },
+                    );
+                return error.MissingImport;
+            };
 
-            for (0..exports.size) |exp_index| {
-                const exp = exports.data[exp_index];
-                const exported_sym_bvec = c.wasm_exporttype_name(exp);
-                const exported_sym = exported_sym_bvec.*.data[0..exported_sym_bvec.*.size];
+        const exported_ty = c.wasmtime_extern_type(self.context(), &value).?;
 
-                if (mem.eql(u8, imported_sym, exported_sym)) {
-                    const exported_ty = c.wasm_exporttype_type(exp).?;
-
-                    if (!externtypeSame(imported_ty, exported_ty)) {
-                        if (!base.build_info.is_test or base.testing.log_level == .debug)
-                            log.err(
-                                "cannot link module `{s}`: type mismatch for imported symbol '{s}' from module '{s}'",
-                                .{ module_name, imported_sym, imported_mod },
-                            );
-                        return error.TypeMismatch;
-                    }
-
-                    const value = existing_instance.@"export"(imported_sym) catch unreachable;
-                    try args.append(self.alloc, value);
-                    continue :args;
-                }
-            }
-
+        if (!externtypeSame(imported_ty, exported_ty)) {
             if (!base.build_info.is_test or base.testing.log_level == .debug)
                 log.err(
-                    "cannot link module `{s}`: imported module `{s}` does not export a symbol `{s}`",
-                    .{ module_name, imported_mod, imported_sym },
+                    "cannot link module `{s}`: type mismatch for imported symbol '{s}' from module '{s}'",
+                    .{ module_name, imported_sym, imported_mod },
                 );
-            return error.MissingImport;
-        } else {
-            if (!base.build_info.is_test or base.testing.log_level == .debug)
-                log.err(
-                    "cannot link module `{s}`: imported module `{s}` does not exist",
-                    .{ module_name, imported_mod },
-                );
-            return error.MissingImport;
+            return error.TypeMismatch;
         }
+
+        try args.append(self.alloc, value);
     }
 
     const inst = try self.arena.allocator().create(Instance);
@@ -188,7 +277,7 @@ pub fn instantiate(self: *Runtime, module_name: []const u8, module: *c.wasmtime_
 }
 
 pub fn context(self: *Runtime) *c.wasmtime_context_t {
-    return c.wasmtime_store_context(self.store) orelse @panic("wasmtime_store_context returned null");
+    return c.wasmtime_store_context(self.store).?;
 }
 
 threadlocal var argv: [max_call_args]c.wasmtime_val_t = undefined;
@@ -212,16 +301,16 @@ pub fn call(self: *Runtime, f: c.wasmtime_func_t, args: []const i32, results: []
 pub fn hostNewMemory(
     eng: *Runtime,
     ty: ?*const c.wasm_memorytype_t,
-    minimum: usize,
-    maximum: usize,
-    reserved_size_in_bytes: usize,
-    guard_size_in_bytes: usize,
+    minimum: u64,
+    maximum: u64,
+    reserved_size_in_bytes: u64,
+    guard_size_in_bytes: u64,
     memory_ret: [*c]c.wasmtime_linear_memory_t,
 ) callconv(.c) ?*c.wasmtime_error_t {
     _ = ty;
 
-    const reservation: usize = if (reserved_size_in_bytes != 0) reserved_size_in_bytes else Memory.wasm_region_size;
-    const guard: usize = guard_size_in_bytes;
+    const reservation: u64 = if (reserved_size_in_bytes != 0) reserved_size_in_bytes else Memory.wasm_region_size;
+    const guard: u64 = guard_size_in_bytes;
 
     if (reservation < Memory.wasm_region_size)
         return c.wasmtime_error_new("host memory: reservation below 4gb; the fixed swap-zone ABI requires the full 4gb (check wasmtime memory_reservation config)");
@@ -229,7 +318,7 @@ pub fn hostNewMemory(
         return c.wasmtime_error_new("host memory: reservation+guard not above 4gb; bounds-check elision is off and the swap zone would be unreachable (check memory_reservation/memory_guard_size config)");
     if (minimum > Memory.binding_region_base)
         return c.wasmtime_error_new("host memory: module memory larger than the guest region below the binding region");
-    const no_max = maximum == math.maxInt(usize);
+    const no_max = maximum == math.maxInt(u64);
     if (!no_max and maximum == minimum)
         return c.wasmtime_error_new("host memory: min == max makes this a static heap; declare a dynamic memory so the 4gb reservation (and the zone at 0xFFFF0000) is actually honored");
 
