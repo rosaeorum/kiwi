@@ -7,146 +7,7 @@ handle: *c.struct_GLFWwindow,
 surface: Gpu.Surface,
 swap_chain: Gpu.SwapChain,
 
-pub const Config = extern struct {
-    pub const default_title = "untitled window";
-
-    /// the initial title for the window
-    title: [*:0]const u8 = default_title,
-    /// the initial size of the window
-    size: [2]u32 = .{ 800, 600 },
-    /// the initial position of the window
-    ///
-    /// `null` will automatically position the window, centered on the active monitor
-    position: ?*const [2]i32 = null,
-    /// the monitor onto which to spawn the window in fullscreen mode
-    fullscreen_monitor: ?*Monitor = null,
-
-    flags: packed struct(u32) {
-        /// specifies whether the windowed mode window will be given input focus when created
-        ///
-        /// ignored for full screen and initially hidden windows
-        focused: bool = false,
-        /// specifies whether the windowed mode will be iconified when created
-        iconified: bool = false,
-        /// specifies whether the windowed mode window will be initially visible
-        ///
-        /// ignored for full screen windows
-        visible: bool = false,
-        /// specifies whether the windowed mode window will be maximized when created
-        ///
-        /// ignored for full screen windows
-        maximized: bool = false,
-
-        /// specifies whether the windowed mode window will have window decorations such as a border, a close widget, etc
-        ///
-        /// ignored for full screen windows
-        decorated: bool = true,
-
-        /// specifies whether the windowed mode window will be floating above other regular windows, also called topmost or always-on-top
-        ///
-        /// "intended primarily for debugging purposes and cannot be used to implement proper full screen windows"
-        ///
-        /// ignored for full screen windows
-        floating: bool = false,
-        /// specifies whether the windowed mode window will be resizable *by the user*
-        ///
-        /// ignored for full screen and undecorated windows
-        resizable: bool = true,
-
-        /// specifies whether the full screen window will automatically iconify and restore the previous video mode on input focus loss
-        ///
-        /// ignored for windowed mode windows
-        auto_iconify: bool = true,
-        /// specifies whether the window will be given input focus when Window.show() is called
-        ///
-        focus_on_show: bool = true,
-        /// specifies whether the cursor should be centered over newly created full screen windows
-        ///
-        /// ignored for windowed mode windows
-        center_cursor: bool = false,
-
-        /// specifies whether the window content area should be resized based on content scale changes
-        ///
-        /// a content scale change can occur because of a global user settings change, or
-        /// because the window was moved to a monitor with different scale settings
-        ///
-        /// this only has an effect on platforms where screen coordinates and pixels always map 1:1, such as Windows and X11
-        ///
-        /// on platforms like macOS, the resolution of the framebuffer can change independently of the window size
-        scale_to_monitor: bool = false,
-        /// specifies whether the framebuffer should be resized based on content scale changes
-        ///
-        /// a content scale change can occur because of a global user settings change, or
-        /// because the window was moved to a monitor with different scale settings
-        ///
-        /// this hint only has an effect on platforms where screen coordinates can be scaled relative to pixel coordinates, such as macOS and Wayland
-        ///
-        /// on platforms like Windows and X11 the framebuffer and window content area sizes always map 1:1
-        scale_framebuffer: bool = false,
-
-        /// specifies whether the window framebuffer will be transparent
-        ///
-        /// if enabled and supported by the system, the window framebuffer alpha channel will be used to combine the framebuffer with the background
-        ///
-        /// this does not affect window decorations
-        transparent_framebuffer: bool = false,
-
-        /// specifies whether the window is transparent to mouse input, letting any mouse events pass through to whatever window is behind it
-        ///
-        /// only supported for undecorated windows
-        ///
-        /// decorated windows with this enabled will behave differently between platforms
-        mouse_passthrough: bool = false,
-
-        // platform specific extensions
-
-        cocoa_graphics_switching: bool = false,
-        win32_keyboard_menu: bool = false,
-        win32_showdefault: bool = true,
-
-        _unused_bits: u15 = 0,
-    } = .{},
-
-    strings: extern struct {
-        cocoa_frame_name: ?[*:0]const u8 = null,
-        x11_class_name: ?[*:0]const u8 = null,
-        x11_instance_name: ?[*:0]const u8 = null,
-        wayland_app_id: ?[*:0]const u8 = null,
-    } = .{},
-
-    pub const flag_enums = struct {
-        pub const focused = c.GLFW_FOCUSED;
-        pub const iconified = c.GLFW_ICONIFIED;
-        pub const visible = c.GLFW_VISIBLE;
-        pub const maximized = c.GLFW_MAXIMIZED;
-        pub const decorated = c.GLFW_DECORATED;
-        pub const floating = c.GLFW_FLOATING;
-        pub const resizable = c.GLFW_RESIZABLE;
-        pub const auto_iconify = c.GLFW_AUTO_ICONIFY;
-        pub const focus_on_show = c.GLFW_FOCUS_ON_SHOW;
-        pub const center_cursor = c.GLFW_CENTER_CURSOR;
-        pub const scale_to_monitor = c.GLFW_SCALE_TO_MONITOR;
-        pub const scale_framebuffer = c.GLFW_SCALE_FRAMEBUFFER;
-        pub const transparent_framebuffer = c.GLFW_TRANSPARENT_FRAMEBUFFER;
-        pub const mouse_passthrough = c.GLFW_MOUSE_PASSTHROUGH;
-        pub const cocoa_graphics_switching = c.GLFW_COCOA_GRAPHICS_SWITCHING;
-        pub const win32_keyboard_menu = c.GLFW_WIN32_KEYBOARD_MENU;
-        pub const win32_showdefault = c.GLFW_WIN32_SHOWDEFAULT;
-    };
-
-    pub const string_enums = struct {
-        pub const cocoa_frame_name = c.GLFW_COCOA_FRAME_NAME;
-        pub const x11_class_name = c.GLFW_X11_CLASS_NAME;
-        pub const x11_instance_name = c.GLFW_X11_INSTANCE_NAME;
-        pub const wayland_app_id = c.GLFW_WAYLAND_APP_ID;
-    };
-};
-
-pub const Monitor = struct {
-    handle: *c.struct_GLFWmonitor,
-};
-
-pub fn init(gpu: *Gpu, config: *const Config) !*Window {
+pub fn init(gpu: *Gpu, config: *const api.WindowConfig) !*Window {
     const self = try _beginPreinit(gpu.device.instance, config);
     errdefer self._destroyPreinit(gpu.device.instance);
 
@@ -160,7 +21,34 @@ pub fn deinit(self: *Window) void {
     self._destroyPreinit(self.gpu.device.instance);
 }
 
-pub fn _beginPreinit(instance: *Gpu.Instance, config: *const Config) !*Window {
+pub const flag_enums = struct {
+    pub const focused = c.GLFW_FOCUSED;
+    pub const iconified = c.GLFW_ICONIFIED;
+    pub const visible = c.GLFW_VISIBLE;
+    pub const maximized = c.GLFW_MAXIMIZED;
+    pub const decorated = c.GLFW_DECORATED;
+    pub const floating = c.GLFW_FLOATING;
+    pub const resizable = c.GLFW_RESIZABLE;
+    pub const auto_iconify = c.GLFW_AUTO_ICONIFY;
+    pub const focus_on_show = c.GLFW_FOCUS_ON_SHOW;
+    pub const center_cursor = c.GLFW_CENTER_CURSOR;
+    pub const scale_to_monitor = c.GLFW_SCALE_TO_MONITOR;
+    pub const scale_framebuffer = c.GLFW_SCALE_FRAMEBUFFER;
+    pub const transparent_framebuffer = c.GLFW_TRANSPARENT_FRAMEBUFFER;
+    pub const mouse_passthrough = c.GLFW_MOUSE_PASSTHROUGH;
+    pub const cocoa_graphics_switching = c.GLFW_COCOA_GRAPHICS_SWITCHING;
+    pub const win32_keyboard_menu = c.GLFW_WIN32_KEYBOARD_MENU;
+    pub const win32_showdefault = c.GLFW_WIN32_SHOWDEFAULT;
+};
+
+pub const string_enums = struct {
+    pub const cocoa_frame_name = c.GLFW_COCOA_FRAME_NAME;
+    pub const x11_class_name = c.GLFW_X11_CLASS_NAME;
+    pub const x11_instance_name = c.GLFW_X11_INSTANCE_NAME;
+    pub const wayland_app_id = c.GLFW_WAYLAND_APP_ID;
+};
+
+pub fn _beginPreinit(instance: *Gpu.Instance, config: *const api.WindowConfig) !*Window {
     const self = try base.gpa.create(Window);
     errdefer base.gpa.destroy(self);
 
@@ -171,15 +59,15 @@ pub fn _beginPreinit(instance: *Gpu.Instance, config: *const Config) !*Window {
         c.glfwWindowHint(c.GLFW_POSITION_Y, pos[1]);
     }
 
-    inline for (comptime meta.fieldNames(@FieldType(Config, "flags"))) |boolean| {
+    inline for (comptime meta.fieldNames(flag_enums)) |boolean| {
         if (comptime base.mem.eql(u8, boolean, "_unused_bits")) continue;
 
-        c.glfwWindowHint(@field(Config.flag_enums, boolean), @intFromBool(@field(config.flags, boolean)));
+        c.glfwWindowHint(@field(flag_enums, boolean), @intFromBool(@field(config.flags, boolean)));
     }
 
-    inline for (comptime meta.fieldNames(@FieldType(Config, "strings"))) |string| {
+    inline for (comptime meta.fieldNames(string_enums)) |string| {
         if (@field(config.strings, string)) |value| {
-            c.glfwWindowHintString(@field(Config.string_enums, string), value);
+            c.glfwWindowHintString(@field(string_enums, string), value);
         }
     }
 
@@ -264,6 +152,7 @@ pub fn present(self: *Window) Gpu.SwapChain.PresentState {
 const c = @import("external/glfw.zig");
 const vk = @import("external/vulkan.zig");
 
+const api = @import("../api.zig");
 const linalg = @import("../linalg.zig");
 const frame = @import("frame.zig");
 const base = @import("../base.zig");

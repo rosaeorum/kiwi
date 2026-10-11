@@ -36,7 +36,7 @@ pub fn init(gpu: *Gpu) !CommandBuffer {
 
     self.staging = try Gpu.StagingBuffer.init(
         self.gpu,
-        (@import("static_config").gpu_staging_capacity * 1024 * 1024),
+        @import("static_config").gpu_staging_capacity * 1024 * 1024,
     );
     errdefer self.staging.deinit(self.gpu);
 
@@ -319,7 +319,7 @@ pub fn flush(self: *CommandBuffer) void {
 
     const memory_barrier = vk.MemoryBarrier{
         .src_access_mask = .{ .transfer_write = true },
-        .dst_access_mask = .{ .shader_read = true }, // Or vertex_attribute_read if using standard VBOs
+        .dst_access_mask = .{ .shader_read = true },
     };
 
     self.gpu.device.proxy.cmdPipelineBarrier(
@@ -327,7 +327,7 @@ pub fn flush(self: *CommandBuffer) void {
         .{ .transfer = true },
         .{ .vertex_shader = true, .fragment_shader = true },
         .{},
-        &[_]vk.MemoryBarrier{memory_barrier}, // <-- Added global memory barrier here!
+        &[_]vk.MemoryBarrier{memory_barrier},
         null,
         self.image_barriers.values(),
     );

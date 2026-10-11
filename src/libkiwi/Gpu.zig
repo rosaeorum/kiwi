@@ -234,7 +234,7 @@ pub fn getExtensionByName(name: []const u8) !Extension {
     return extension_map.get(name) orelse error.InvalidExtensionName;
 }
 
-pub fn vkSemanticVersion(v: base.SemanticVersion) vk.Version {
+pub fn vkSemanticVersion(v: api.SemVer) vk.Version {
     return vk.makeApiVersion(
         0,
         @intCast(v.major),
@@ -529,7 +529,7 @@ test Gpu {
     const instance = try Instance.init(
         true,
         "gpu headless test",
-        @import("static_config").engine_version,
+        .fromBase(&@import("static_config").engine_version),
         &.{},
     );
     defer instance.deinit();
@@ -589,6 +589,7 @@ pub const ImageView = vk.ImageView;
 pub const vk = @import("external/vulkan.zig");
 pub const vma = @import("external/vma.zig");
 
+const api = @import("../api.zig");
 const linalg = @import("../linalg.zig");
 const frame = @import("frame.zig");
 const Window = @import("Window.zig");

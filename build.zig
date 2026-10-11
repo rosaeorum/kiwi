@@ -1,3 +1,5 @@
+// public domain
+
 var is_windows: bool = undefined;
 var target: Build.ResolvedTarget = undefined;
 var wasm_target: Build.ResolvedTarget = undefined;
@@ -72,7 +74,7 @@ pub fn build(b: *Build) !void {
     wasmtime_lib_path = buildWasmtime(b);
     static_config = buildStaticConfig(b);
 
-    // NOTE: there is a bug on linux where static linking wasmtime fails under self hosted linker; must use lld for now
+    // NOTE: there is a bug where static linking wasmtime fails under self hosted linker; must use lld for now
 
     const kiwi_mod = createModule(b, "kiwi", b.path("src/libkiwi.zig"));
     {
@@ -421,6 +423,9 @@ fn addGlsl(b: *Build, source: Build.LazyPath) Build.LazyPath {
 fn buildStaticConfig(b: *Build) *Build.Step.Options {
     const conf = b.addOptions();
     conf.addOption(base.SemanticVersion, "engine_version", zon_version);
+
+    const dump_static_step = b.step("gen-static", "dump `static_config` for review");
+    dump_static_step.dependOn(&b.addInstallFile(conf.getOutput(), "static_config.zig").step);
 
     inline for (comptime base.meta.declarations(config)) |prop_name| {
         const prop = @field(config, prop_name);

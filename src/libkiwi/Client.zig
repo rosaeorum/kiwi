@@ -5,20 +5,7 @@ const Client = @This();
 gpu: *Gpu,
 main_window: *Window,
 
-pub const Config = struct {
-    /// Should the vulkan validation layer be enabled?
-    validation: bool = base.build_info.mode == .debug,
-    /// NOTE: if glfw selects wayland, renderdoc won't work; this flag forces it to use x11
-    render_doc_compat: bool = base.build_info.mode == .debug,
-    /// Name of the application utilizing kiwi engine; passed to the vulkan driver.
-    application_name: [*:0]const u8 = "kiwi engine application",
-    /// Version of the application utilizing kiwi engine; passed to the vulkan driver.
-    application_version: base.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
-    /// Initial configuration for the client's primary window.
-    main_window: Window.Config = .{},
-};
-
-pub fn init(config: *const Config) !*Client {
+pub fn init(config: *const api.Config) !*Client {
     var exts: base.ArrayList(Gpu.Extension) = try .initCapacity(base.temp, Gpu.vk_extension_names.len);
 
     if (config.render_doc_compat and base.build_info.os.tag == .linux) {
@@ -93,6 +80,7 @@ pub fn pollEvents(_: *Client) void {
 pub const Window = @import("Window.zig");
 
 const c = @import("external/glfw.zig");
+const api = @import("../api.zig");
 const linalg = @import("../linalg.zig");
 const base = @import("../base.zig");
 const mem = base.mem;

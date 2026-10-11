@@ -61,7 +61,7 @@ pub const GetInstanceProcAddr: vk.PfnGetInstanceProcAddr = if (base.build_info.t
 pub fn init(
     enable_validation: bool,
     application_name: [*:0]const u8,
-    application_version: base.SemanticVersion,
+    application_version: api.SemVer,
     extensions: []const Gpu.Extension,
 ) !*Instance {
     const self = try base.gpa.create(Instance);
@@ -93,7 +93,7 @@ pub fn init(
         .p_application_name = application_name,
         .application_version = Gpu.vkSemanticVersion(application_version).toU32(),
         .p_engine_name = "kiwi_vk",
-        .engine_version = Gpu.vkSemanticVersion(@import("static_config").engine_version).toU32(),
+        .engine_version = Gpu.vkSemanticVersion(.fromBase(&@import("static_config").engine_version)).toU32(),
         .api_version = vk.API_VERSION_1_3.toU32(),
     };
 
@@ -441,6 +441,7 @@ fn checkExtensionSupport(
     return true;
 }
 
+const api = @import("../../api.zig");
 const base = @import("../../base.zig");
 const vk = @import("../external/vulkan.zig");
 const vma = @import("../external/vma.zig");

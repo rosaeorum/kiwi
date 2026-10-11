@@ -170,8 +170,10 @@ pub fn protect(buf: []align(page_align) u8, x: process.MemoryProtection) !void {
 
 pub const gpa = heap.smp_allocator;
 pub const temp = temp_arena.allocator();
+pub const static = static_arena.allocator();
 
 pub var temp_arena: VArena = .empty;
+var static_arena: VArena = .empty;
 
 pub fn valloc(comptime T: type, size: u64) ![]align(page_align) T {
     const buf = try vmap(T, size);
