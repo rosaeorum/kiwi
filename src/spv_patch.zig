@@ -1,3 +1,5 @@
+// public domain
+
 //! This tool fixes a specific bug in the Zig compiler's SPIR-V backend. When Zig
 //! compiles a shader to SPIR-V, it sometimes produces structs that contain a
 //! "runtime-sized array" (an array whose length isn't known at compile time, like
