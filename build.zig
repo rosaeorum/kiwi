@@ -133,10 +133,7 @@ pub fn build(b: *Build) !void {
             .root_source_file = addZigScript(
                 b,
                 "runtime_test_guest_a",
-                source_writer.add(
-                    "runtime_test_guest_a.zig",
-                    runtime_test_src.guest_a_src,
-                ),
+                b.path("static/script/test/guest_a.zig"),
             ),
         });
         runtime_test_mod.addAnonymousImport(
@@ -145,10 +142,7 @@ pub fn build(b: *Build) !void {
                 .root_source_file = addZigScript(
                     b,
                     "runtime_test_guest_b",
-                    source_writer.add(
-                        "runtime_test_guest_b.zig",
-                        runtime_test_src.guest_b_src,
-                    ),
+                    b.path("static/script/test/guest_b.zig"),
                 ),
             },
         );
@@ -666,8 +660,6 @@ const config = @import("build.config.zig");
 const zon_text = @embedFile("build.zig.zon");
 
 const base = @import("src/base.zig");
-
-const runtime_test_src = @import("src/runtime_test.zig");
 
 const Translator = @import("translate_c").Translator;
 
