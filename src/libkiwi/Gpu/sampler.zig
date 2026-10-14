@@ -31,14 +31,14 @@ pub const Index = u32;
 
 pub const Config = struct {
     unnormalized_coordinates: bool = false,
-    mag_filter: Gpu.Filter,
-    min_filter: Gpu.Filter,
-    mipmap_mode: Gpu.MipmapMode,
-    address_mode_u: Gpu.AddressMode = .repeat,
-    address_mode_v: Gpu.AddressMode = .repeat,
-    address_mode_w: Gpu.AddressMode = .repeat,
-    compare_op: Gpu.CompareOp = .none,
-    border_color: Gpu.BorderColor = .int_opaque_white,
+    mag_filter: Filter,
+    min_filter: Filter,
+    mipmap_mode: MipmapMode,
+    address_mode_u: AddressMode = .repeat,
+    address_mode_v: AddressMode = .repeat,
+    address_mode_w: AddressMode = .repeat,
+    compare_op: CompareOp = .none,
+    border_color: BorderColor = .int_opaque_white,
     min_lod: f32 = 0.0,
     max_lod: f32 = 0.0,
     mip_lod_bias: f32 = 0.0,
@@ -74,14 +74,14 @@ pub const Data = extern struct {
 
     pub const Packed = packed struct(u32) {
         unnormalized_coordinates: bool = false, // 1
-        mag_filter: Gpu.Filter = .nearest, // 2
-        min_filter: Gpu.Filter = .nearest, // 2
-        mipmap_mode: Gpu.MipmapMode = .nearest, // 1
-        address_mode_u: Gpu.AddressMode = .clamp_to_edge, // 3
-        address_mode_v: Gpu.AddressMode = .clamp_to_edge, // 3
-        address_mode_w: Gpu.AddressMode = .clamp_to_edge, // 3
-        compare_op: Gpu.CompareOp = .none, // 4
-        border_color: Gpu.BorderColor = .float_opaque_black, // 3
+        mag_filter: Filter = .nearest, // 2
+        min_filter: Filter = .nearest, // 2
+        mipmap_mode: MipmapMode = .nearest, // 1
+        address_mode_u: AddressMode = .clamp_to_edge, // 3
+        address_mode_v: AddressMode = .clamp_to_edge, // 3
+        address_mode_w: AddressMode = .clamp_to_edge, // 3
+        compare_op: CompareOp = .none, // 4
+        border_color: BorderColor = .float_opaque_black, // 3
         // 1 + 2 + 2 + 1 + 3 + 3 + 3 + 4 + 3 = 22
         _unused: u10 = 0,
 
@@ -248,9 +248,135 @@ pub const Store = struct {
     }
 };
 
+pub const Filter = enum(u2) {
+    nearest,
+    linear,
+    cubic,
+
+    pub fn fromVk(f: vk.Filter) Filter {
+        return switch (f) {
+            _ => |u| debug.panic("unsupported vulkan value: {s}", .{@tagName(u)}),
+            inline else => |comptime_tag| if (@hasField(Filter, @tagName(comptime_tag)))
+                @field(vk.Filter, @tagName(comptime_tag))
+            else
+                @compileError("unsupported vulkan value: vk.Filter." ++ @tagName(comptime_tag)),
+        };
+    }
+
+    pub fn toVk(self: Filter) vk.Filter {
+        return switch (self) {
+            inline else => |comptime_tag| return if (@hasField(vk.Filter, @tagName(comptime_tag))) @field(vk.Filter, @tagName(comptime_tag)) else @field(vk.Filter, @tagName(comptime_tag) ++ "_ext"),
+        };
+    }
+};
+
+pub const MipmapMode = enum(u1) {
+    nearest,
+    linear,
+
+    pub fn fromVk(f: vk.SamplerMipmapMode) MipmapMode {
+        return switch (f) {
+            _ => |u| debug.panic("unsupported vulkan value: {s}", .{@tagName(u)}),
+            inline else => |comptime_tag| if (@hasField(MipmapMode, @tagName(comptime_tag)))
+                @field(vk.SamplerMipmapMode, @tagName(comptime_tag))
+            else
+                @compileError("unsupported vulkan value: vk.SamplerMipmapMode." ++ @tagName(comptime_tag)),
+        };
+    }
+
+    pub fn toVk(self: MipmapMode) vk.SamplerMipmapMode {
+        return switch (self) {
+            inline else => |comptime_tag| return @field(vk.SamplerMipmapMode, @tagName(comptime_tag)),
+        };
+    }
+};
+
+pub const AddressMode = enum(u3) {
+    repeat,
+    mirrored_repeat,
+    clamp_to_edge,
+    clamp_to_border,
+    mirror_clamp_to_edge,
+
+    pub fn fromVk(f: vk.SamplerAddressMode) AddressMode {
+        return switch (f) {
+            _ => |u| debug.panic("unsupported vulkan value: {s}", .{@tagName(u)}),
+            inline else => |comptime_tag| if (@hasField(AddressMode, @tagName(comptime_tag)))
+                @field(vk.SamplerAddressMode, @tagName(comptime_tag))
+            else
+                @compileError("unsupported vulkan value: vk.SamplerAddressMode." ++ @tagName(comptime_tag)),
+        };
+    }
+
+    pub fn toVk(self: AddressMode) vk.SamplerAddressMode {
+        return switch (self) {
+            inline else => |comptime_tag| return @field(vk.SamplerAddressMode, @tagName(comptime_tag)),
+        };
+    }
+};
+
+pub const CompareOp = enum(u4) {
+    none,
+    never,
+    less,
+    equal,
+    less_or_equal,
+    greater,
+    not_equal,
+    greater_or_equal,
+    always,
+
+    pub fn fromVk(f: vk.CompareOp) CompareOp {
+        return switch (f) {
+            _ => |u| debug.panic("unsupported vulkan value: {s}", .{@tagName(u)}),
+            inline else => |comptime_tag| if (@hasField(CompareOp, @tagName(comptime_tag)))
+                @field(vk.CompareOp, @tagName(comptime_tag))
+            else
+                @compileError("unsupported vulkan value: vk.CompareOp." ++ @tagName(comptime_tag)),
+        };
+    }
+
+    pub fn toVk(self: CompareOp) ?vk.CompareOp {
+        return switch (self) {
+            .none => null,
+            inline else => |comptime_tag| return @field(vk.CompareOp, @tagName(comptime_tag)),
+        };
+    }
+};
+
+pub const BorderColor = enum(u3) {
+    float_transparent_black,
+    int_transparent_black,
+    float_opaque_black,
+    int_opaque_black,
+    float_opaque_white,
+    int_opaque_white,
+
+    // TODO: support custom color ext?
+
+    pub fn fromVk(f: vk.BorderColor) ?BorderColor {
+        return switch (f) {
+            .float_custom_ext, .int_custom_ext, _ => |u| {
+                debug.panic("unsupported vulkan value: {s}", .{@tagName(u)});
+            },
+            inline else => |comptime_tag| if (@hasField(BorderColor, @tagName(comptime_tag)))
+                @field(vk.BorderColor, @tagName(comptime_tag))
+            else
+                @compileError("unsupported vulkan value: vk.BorderColor." ++ @tagName(comptime_tag)),
+        };
+    }
+
+    pub fn toVk(self: BorderColor) vk.BorderColor {
+        return switch (self) {
+            inline else => |comptime_tag| return @field(vk.BorderColor, @tagName(comptime_tag)),
+        };
+    }
+};
+
 const base = @import("../../base.zig");
 const vk = @import("../external/vulkan.zig");
 const Gpu = @import("../Gpu.zig");
 
 const mem = base.mem;
 const math = base.math;
+const debug = base.debug;
